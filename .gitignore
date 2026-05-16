@@ -2,3 +2,7 @@ launcher
 *.o
 *-client.h
 *-client.c
+*.pkg.tar.zst
+*.tar.gz
+src/
+pkg/

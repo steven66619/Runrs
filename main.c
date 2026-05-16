@@ -45,6 +45,7 @@ struct state {
     struct xkb_context *xkb_ctx;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
+    xkb_keycode_t kc_esc, kc_bksp, kc_ret, kc_up, kc_down;
 
     struct wl_buffer *buffer;
     cairo_surface_t *cairo_surface;
@@ -217,11 +218,15 @@ static void populate_entries(struct state *st)
 
     struct dirent *de;
     while ((de = readdir(dir)) != NULL && st->n_entries < MAX_ENTRIES) {
-        if (de->d_type != DT_REG && de->d_type != DT_LNK) continue;
+        char path[512];
+        if (de->d_type == DT_UNKNOWN) {
+            struct stat st_buf;
+            snprintf(path, sizeof(path), "/usr/share/applications/%s", de->d_name);
+            if (stat(path, &st_buf) != 0 || !S_ISREG(st_buf.st_mode)) continue;
+        } else if (de->d_type != DT_REG && de->d_type != DT_LNK) continue;
         char *dot = strrchr(de->d_name, '.');
         if (!dot || strcmp(dot, ".desktop") != 0) continue;
 
-        char path[512];
         snprintf(path, sizeof(path), "/usr/share/applications/%s", de->d_name);
 
         FILE *f = fopen(path, "r");
@@ -476,6 +481,8 @@ static void destroy(struct state *st)
     st->configured = false;
 }
 
+static bool running;
+
 static void layer_surface_configure(void *data,
     struct zwlr_layer_surface_v1 *surface, uint32_t serial,
     uint32_t width, uint32_t height)
@@ -487,13 +494,15 @@ static void layer_surface_configure(void *data,
         st->height = height;
     }
     if (!st->buffer) {
-        create_buffer(st);
+        if (create_buffer(st) != 0) {
+            fprintf(stderr, "failed to create buffer\n");
+            running = false;
+            return;
+        }
         render(st);
     }
     st->configured = true;
 }
-
-static bool running;
 
 static void layer_surface_closed(void *data,
     struct zwlr_layer_surface_v1 *surface)
@@ -606,6 +615,11 @@ static void keyboard_keymap(void *data, struct wl_keyboard *kb,
     close(fd);
     if (!st->xkb_keymap) return;
     st->xkb_state = xkb_state_new(st->xkb_keymap);
+    st->kc_esc  = xkb_keymap_key_by_name(st->xkb_keymap, "ESC");
+    st->kc_bksp = xkb_keymap_key_by_name(st->xkb_keymap, "BKSP");
+    st->kc_ret  = xkb_keymap_key_by_name(st->xkb_keymap, "RTRN");
+    st->kc_up   = xkb_keymap_key_by_name(st->xkb_keymap, "UP");
+    st->kc_down = xkb_keymap_key_by_name(st->xkb_keymap, "DOWN");
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *kb,
@@ -618,15 +632,15 @@ static void keyboard_key(void *data, struct wl_keyboard *kb,
     uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
 {
     struct state *st = data;
-    if (state != 1) return;
     if (!st->xkb_state) return;
-    xkb_keysym_t sym = xkb_state_key_get_one_sym(st->xkb_state, key);
+    xkb_state_update_key(st->xkb_state, key, state ? XKB_KEY_DOWN : XKB_KEY_UP);
+    if (state != 1) return;
 
-    if (sym == XKB_KEY_Escape) {
+    if (st->kc_esc != XKB_KEYCODE_INVALID && key == st->kc_esc) {
         running = false;
         return;
     }
-    if (sym == XKB_KEY_Return) {
+    if (st->kc_ret != XKB_KEYCODE_INVALID && key == st->kc_ret) {
         int idx = (st->hovered_idx >= 0) ? st->hovered_idx :
                    (st->n_filtered > 0 ? st->filtered[0] : -1);
         if (idx >= 0) {
@@ -635,14 +649,14 @@ static void keyboard_key(void *data, struct wl_keyboard *kb,
         }
         return;
     }
-    if (sym == XKB_KEY_BackSpace) {
+    if (st->kc_bksp != XKB_KEYCODE_INVALID && key == st->kc_bksp) {
         int len = strlen(st->search);
         if (len > 0) st->search[len - 1] = '\0';
         update_filter(st);
         render(st);
         return;
     }
-    if (sym == XKB_KEY_Up || sym == XKB_KEY_KP_Up) {
+    if (st->kc_up != XKB_KEYCODE_INVALID && key == st->kc_up) {
         if (st->n_filtered == 0) return;
         int cur = -1;
         for (int j = 0; j < st->n_filtered; j++) {
@@ -657,7 +671,7 @@ static void keyboard_key(void *data, struct wl_keyboard *kb,
         render(st);
         return;
     }
-    if (sym == XKB_KEY_Down || sym == XKB_KEY_KP_Down) {
+    if (st->kc_down != XKB_KEYCODE_INVALID && key == st->kc_down) {
         if (st->n_filtered == 0) return;
         int cur = -1;
         for (int j = 0; j < st->n_filtered; j++) {
@@ -677,17 +691,19 @@ static void keyboard_key(void *data, struct wl_keyboard *kb,
     }
 
     char buf[8];
-    int n = xkb_keysym_to_utf8(sym, buf, sizeof(buf));
-    if (n > 0 && isprint((unsigned char)buf[0])) {
-        buf[n] = '\0';
-        int len = strlen(st->search);
-        if (len + n < (int)sizeof(st->search) - 1) {
-            memcpy(st->search + len, buf, n);
-            st->search[len + n] = '\0';
+    int n = xkb_state_key_get_utf8(st->xkb_state, key, buf, sizeof(buf));
+    if (n > 0) {
+        gunichar uc = g_utf8_get_char_validated(buf, n);
+        if (uc > 0 && g_unichar_isprint(uc)) {
+            int len = strlen(st->search);
+            if (len + n < (int)sizeof(st->search) - 1) {
+                memcpy(st->search + len, buf, n);
+                st->search[len + n] = '\0';
+            }
+            update_filter(st);
+            st->hovered_idx = st->n_filtered > 0 ? st->filtered[0] : -1;
+            render(st);
         }
-        update_filter(st);
-        st->hovered_idx = st->n_filtered > 0 ? st->filtered[0] : -1;
-        render(st);
     }
 }
 
@@ -725,17 +741,17 @@ static void seat_capabilities(void *data, struct wl_seat *seat,
     uint32_t capabilities)
 {
     struct state *st = data;
-    if ((capabilities & 1) && !st->pointer) {
+    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !st->pointer) {
         st->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(st->pointer, &pointer_listener, st);
-    } else if (!(capabilities & 1) && st->pointer) {
+    } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && st->pointer) {
         wl_pointer_destroy(st->pointer);
         st->pointer = NULL;
     }
-    if ((capabilities & 2) && !st->keyboard) {
+    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && !st->keyboard) {
         st->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(st->keyboard, &keyboard_listener, st);
-    } else if (!(capabilities & 2) && st->keyboard) {
+    } else if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && st->keyboard) {
         wl_keyboard_destroy(st->keyboard);
         st->keyboard = NULL;
     }
@@ -792,6 +808,7 @@ int main(int argc, char *argv[])
     struct wl_registry *registry = wl_display_get_registry(st.display);
     wl_registry_add_listener(registry, &registry_listener, &st);
     wl_display_roundtrip(st.display);
+    wl_registry_destroy(registry);
 
     if (!st.compositor || !st.shm || !st.layer_shell) {
         fprintf(stderr, "missing required wayland globals\n");
@@ -803,6 +820,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: failed to create xkb context (keyboard input disabled)\n");
 
     populate_entries(&st);
+
+    signal(SIGCHLD, SIG_IGN);
 
     st.surface = wl_compositor_create_surface(st.compositor);
     if (!st.surface) return 1;
