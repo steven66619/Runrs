@@ -1,0 +1,16 @@
+[package]
+name = "launcher"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+cairo-rs = { version = "0.22", features = ["png", "use_glib"] }
+pango = "0.22"
+pangocairo = "0.22"
+xkbcommon = { version = "0.9", default-features = false, features = ["wayland"] }
+xkeysym = "0.2"
+memmap2 = "0.9"
+glib = "0.22"
+libc = "0.2"

@@ -1,8 +1,2 @@
-launcher
-*.o
-*-client.h
-*-client.c
-*.pkg.tar.zst
+/target
 *.tar.gz
-src/
-pkg/
