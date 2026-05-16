@@ -17,6 +17,7 @@
 #include <cairo.h>
 #include <pango/pangocairo.h>
 #include <xkbcommon/xkbcommon.h>
+#include <librsvg/rsvg.h>
 
 #define MAX_ENTRIES 512
 #define ICON_SIZE 28
@@ -63,28 +64,71 @@ struct state {
     struct wl_surface *current_pointer_surface;
 };
 
-static cairo_surface_t *load_icon(const char *name)
+static cairo_surface_t *load_png(const char *base, const char *name)
 {
-    if (!name || !name[0]) return NULL;
-
     char path[512];
-    int sizes[] = {48, 64, 32, 128, 96, 72};
-
-    for (size_t si = 0; si < sizeof(sizes)/sizeof(sizes[0]); si++) {
-        snprintf(path, sizeof(path),
-            "/usr/share/icons/hicolor/%dx%d/apps/%s.png",
-            sizes[si], sizes[si], name);
-        cairo_surface_t *img = cairo_image_surface_create_from_png(path);
-        if (cairo_surface_status(img) == CAIRO_STATUS_SUCCESS)
-            return img;
-        cairo_surface_destroy(img);
-    }
-
-    snprintf(path, sizeof(path), "/usr/share/pixmaps/%s.png", name);
+    snprintf(path, sizeof(path), "%s/%s.png", base, name);
     cairo_surface_t *img = cairo_image_surface_create_from_png(path);
     if (cairo_surface_status(img) == CAIRO_STATUS_SUCCESS)
         return img;
     cairo_surface_destroy(img);
+    return NULL;
+}
+
+static cairo_surface_t *load_svg(const char *base, const char *name, int size)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.svg", base, name);
+    GError *err = NULL;
+    RsvgHandle *handle = rsvg_handle_new_from_file(path, &err);
+    if (!handle) return NULL;
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size, size);
+    cairo_t *cr = cairo_create(surface);
+
+    RsvgRectangle viewport = {0, 0, (double)size, (double)size};
+    gboolean ok = rsvg_handle_render_document(handle, cr, &viewport, &err);
+    cairo_destroy(cr);
+    g_object_unref(handle);
+
+    if (!ok) {
+        cairo_surface_destroy(surface);
+        return NULL;
+    }
+    return surface;
+}
+
+static const char *icon_themes[] = {
+    "hicolor", "Papirus", "Papirus-Dark", "Papirus-Light",
+    "Adwaita", "gnome", "breeze", "breeze-dark",
+    "Numix", "elementary-xfce", "Moka", "Faenza",
+    "Humanity", "ubuntu-mono",
+};
+
+static cairo_surface_t *load_icon(const char *name)
+{
+    if (!name || !name[0]) return NULL;
+
+    int sizes[] = {48, 64, 32, 128, 96, 72};
+
+    for (size_t t = 0; t < sizeof(icon_themes)/sizeof(icon_themes[0]); t++) {
+        for (size_t si = 0; si < sizeof(sizes)/sizeof(sizes[0]); si++) {
+            char base[256];
+            snprintf(base, sizeof(base),
+                "/usr/share/icons/%s/%dx%d/apps", icon_themes[t], sizes[si], sizes[si]);
+            cairo_surface_t *img = load_png(base, name);
+            if (img) return img;
+        }
+
+        char base[256];
+        snprintf(base, sizeof(base),
+            "/usr/share/icons/%s/scalable/apps", icon_themes[t]);
+        cairo_surface_t *img = load_svg(base, name, 48);
+        if (img) return img;
+    }
+
+    cairo_surface_t *img = load_png("/usr/share/pixmaps", name);
+    if (img) return img;
 
     return NULL;
 }
