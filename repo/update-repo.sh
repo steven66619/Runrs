@@ -18,8 +18,14 @@ build_and_update() {
     cd "$ARCH_DIR"
     repo-add launcher.db.tar.zst *.pkg.tar.zst
 
+    # GitHub Pages doesn't follow symlinks, so replace with actual copies
+    rm -f launcher.db launcher.files
+    cp launcher.db.tar.zst launcher.db
+    cp launcher.files.tar.zst launcher.files
+
     echo "==> Done. Ready for GitHub Pages deployment."
     echo "    Push repo/ directory to gh-pages branch:"
+    echo "    git add repo/ && git commit -m 'Update repo' && git push origin master"
     echo "    git subtree push --prefix repo origin gh-pages"
 }
 
