@@ -316,9 +316,10 @@ impl WaylandState {
             }
         }
 
-        let any_missing = self.entries.iter().any(|e|
-            e.icon_key.is_some() && e.icon_path.is_none() && e.icon_surface.is_none()
-        );
+        let any_missing = !self.found_paths.lock().map(|g| g.is_empty()).unwrap_or(true)
+            || self.entries.iter().any(|e|
+                e.icon_path.is_some() && e.icon_surface.is_none()
+            );
 
         let cairo_surface = match self.cairo_surface.as_ref() { Some(s) => s, _ => return };
         let shm_pool = match self.shm_pool.as_ref() { Some(p) => p, _ => return };
@@ -376,23 +377,27 @@ impl WaylandState {
                         .and_then(|e| e.to_str())
                         .map(|e| e.eq_ignore_ascii_case("svg"))
                         .unwrap_or(false);
-                    if is_svg {
-                        if let Ok(handle) = Loader::new().read_path(path) {
-                            if let Ok(surface) = ImageSurface::create(CairoFormat::ARgb32, ICON_SIZE, ICON_SIZE) {
-                                if let Ok(cr) = Context::new(&surface) {
+                    let loaded = if is_svg {
+                        Loader::new().read_path(path).ok().and_then(|handle| {
+                            ImageSurface::create(CairoFormat::ARgb32, ICON_SIZE, ICON_SIZE).ok().and_then(|surface| {
+                                Context::new(&surface).ok().and_then(|cr| {
                                     let renderer = CairoRenderer::new(&handle);
-                                    let _ = renderer.render_document(
+                                    renderer.render_document(
                                         &cr,
                                         &cairo::Rectangle::new(0.0, 0.0, ICON_SIZE as f64, ICON_SIZE as f64),
-                                    );
-                                    self.entries[entry_idx].icon_surface = Some(surface);
-                                }
-                            }
-                        }
-                    } else if let Ok(file) = fs::File::open(path) {
-                        if let Ok(surface) = ImageSurface::create_from_png(&mut std::io::BufReader::new(file)) {
-                            self.entries[entry_idx].icon_surface = Some(surface);
-                        }
+                                    ).ok().map(|_| surface)
+                                })
+                            })
+                        })
+                    } else {
+                        fs::File::open(path).ok().and_then(|file| {
+                            ImageSurface::create_from_png(&mut std::io::BufReader::new(file)).ok()
+                        })
+                    };
+                    if let Some(surface) = loaded {
+                        self.entries[entry_idx].icon_surface = Some(surface);
+                    } else {
+                        self.entries[entry_idx].icon_path = None;
                     }
                 }
             }
