@@ -11,18 +11,10 @@ makedepends=('cargo' 'git')
 provides=('launcher')
 conflicts=('launcher')
 
-source=()
-md5sums=()
+source=("remote_repo::git+https://github.com/steven66619/launcher.git#branch=master")
+md5sums=('SKIP')
 
 validpgpkeys=('908BA367E7E797F3F72B673710F1B1E3F275953D')
-
-prepare() {
-  mkdir -p "$srcdir/remote_repo"
-  cp "$startdir/Cargo.toml" "$srcdir/remote_repo/"
-  cp "$startdir/Cargo.lock" "$srcdir/remote_repo/"
-  cp -r "$startdir/src" "$srcdir/remote_repo/"
-  cp -r "$startdir/.git" "$srcdir/remote_repo/"
-}
 
 pkgver() {
   cd "$srcdir/remote_repo"
