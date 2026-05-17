@@ -3,8 +3,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::thread;
+
 
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
@@ -80,7 +79,6 @@ struct WaylandState {
     needs_render: bool,
     first_configure_done: bool,
     frame_callback: Option<WlCallback>,
-    found_paths: Arc<Mutex<Vec<(usize, PathBuf)>>>,
 }
 
 // Deep structural folder walker optimized for CachyOS and Arch theme directories
@@ -160,7 +158,6 @@ impl WaylandState {
             search: String::new(), hovered_idx: None, cairo_surface: None,
             needs_render: false, first_configure_done: false,
             frame_callback: None,
-            found_paths: Arc::new(Mutex::new(Vec::new())),
         };
         
         state.scan_system_applications();
@@ -216,21 +213,10 @@ impl WaylandState {
         loaded.dedup_by(|a, b| a.exec == b.exec);
         self.entries = loaded;
 
-        let keys_to_load: Vec<(usize, String)> = self.entries.iter().enumerate()
-            .filter_map(|(i, entry)| entry.icon_key.clone().map(|key| (i, key)))
-            .collect();
-
-        let found_paths_worker = Arc::clone(&self.found_paths);
-
-        thread::spawn(move || {
-            for (idx, key) in keys_to_load {
-                if let Some(img_path) = find_icon_path(&key) {
-                    if let Ok(mut guard) = found_paths_worker.lock() {
-                        guard.push((idx, img_path));
-                    }
-                }
-            }
-        });
+        for i in 0..self.entries.len() {
+            let key = self.entries[i].icon_key.clone();
+            self.entries[i].icon_path = key.and_then(|k| find_icon_path(&k));
+        }
     }
 
     fn update_filter(&mut self) {
@@ -308,18 +294,9 @@ impl WaylandState {
         if !self.first_configure_done { return; }
         if self.frame_callback.is_some() { return; }
 
-        if let Ok(mut guard) = self.found_paths.lock() {
-            while let Some((idx, path)) = guard.pop() {
-                if idx < self.entries.len() {
-                    self.entries[idx].icon_path = Some(path);
-                }
-            }
-        }
-
-        let any_missing = !self.found_paths.lock().map(|g| g.is_empty()).unwrap_or(true)
-            || self.entries.iter().any(|e|
-                e.icon_path.is_some() && e.icon_surface.is_none()
-            );
+        let any_missing = self.entries.iter().any(|e|
+            e.icon_path.is_some() && e.icon_surface.is_none()
+        );
 
         let cairo_surface = match self.cairo_surface.as_ref() { Some(s) => s, _ => return };
         let shm_pool = match self.shm_pool.as_ref() { Some(p) => p, _ => return };
@@ -378,20 +355,42 @@ impl WaylandState {
                         .map(|e| e.eq_ignore_ascii_case("svg"))
                         .unwrap_or(false);
                     let loaded = if is_svg {
-                        Loader::new().read_path(path).ok().and_then(|handle| {
-                            ImageSurface::create(CairoFormat::ARgb32, ICON_SIZE, ICON_SIZE).ok().and_then(|surface| {
-                                Context::new(&surface).ok().and_then(|cr| {
-                                    let renderer = CairoRenderer::new(&handle);
-                                    renderer.render_document(
-                                        &cr,
-                                        &cairo::Rectangle::new(0.0, 0.0, ICON_SIZE as f64, ICON_SIZE as f64),
-                                    ).ok().map(|_| surface)
+                        match Loader::new().read_path(path) {
+                            Ok(handle) => {
+                                ImageSurface::create(CairoFormat::ARgb32, ICON_SIZE, ICON_SIZE).ok().and_then(|surface| {
+                                    Context::new(&surface).ok().and_then(|cr| {
+                                        let renderer = CairoRenderer::new(&handle);
+                                        renderer.render_document(
+                                            &cr,
+                                            &cairo::Rectangle::new(0.0, 0.0, ICON_SIZE as f64, ICON_SIZE as f64),
+                                        ).ok()?;
+                                        drop(cr);
+                                        Some(surface)
+                                    })
                                 })
-                            })
-                        })
+                            }
+                            Err(_) => None,
+                        }
                     } else {
                         fs::File::open(path).ok().and_then(|file| {
                             ImageSurface::create_from_png(&mut std::io::BufReader::new(file)).ok()
+                        }).and_then(|src| {
+                            ImageSurface::create(CairoFormat::ARgb32, ICON_SIZE, ICON_SIZE).ok().and_then(|dest| {
+                                Context::new(&dest).ok().and_then(|cr| {
+                                    let sx = ICON_SIZE as f64 / src.width() as f64;
+                                    let sy = ICON_SIZE as f64 / src.height() as f64;
+                                    let s = sx.min(sy);
+                                    let w = src.width() as f64 * s;
+                                    let h = src.height() as f64 * s;
+                                    let ox = (ICON_SIZE as f64 - w) / 2.0;
+                                    let oy = (ICON_SIZE as f64 - h) / 2.0;
+                                    cr.set_source_surface(&src, ox, oy).ok()?;
+                                    cr.rectangle(0.0, 0.0, ICON_SIZE as f64, ICON_SIZE as f64);
+                                    cr.fill().ok()?;
+                                    drop(cr);
+                                    Some(dest)
+                                })
+                            })
                         })
                     };
                     if let Some(surface) = loaded {
@@ -412,14 +411,16 @@ impl WaylandState {
             }
 
             let mut text_offset = 12.0;
-            if let Some(ref icon) = entry.icon_surface {
+            if let Some(icon) = entry.icon_surface.as_ref() {
                 cr.save().ok();
                 let icon_x = sbx + PAD as f64 + 6.0;
                 let icon_y = row_y + ((ROW_HEIGHT - ICON_SIZE) / 2) as f64;
                 
-                cr.set_source_surface(icon, icon_x, icon_y).ok();
+                // TEST: paint icon surface through a clip rect
                 cr.rectangle(icon_x, icon_y, ICON_SIZE as f64, ICON_SIZE as f64);
-                cr.fill().ok();
+                cr.clip();
+                cr.set_source_surface(icon, icon_x, icon_y).ok();
+                cr.paint().ok();
                 cr.restore().ok();
                 
                 text_offset += (ICON_SIZE + 10) as f64;
@@ -435,6 +436,8 @@ impl WaylandState {
 
         drop(cr);
         cairo_surface.flush();
+
+
 
         let callback = surface.frame(qh, ());
         self.frame_callback = Some(callback);
@@ -471,8 +474,7 @@ impl Dispatch<WlSurface, ()> for WaylandState { fn event(_: &mut Self, _: &WlSur
 impl Dispatch<WlCallback, ()> for WaylandState {
     fn event(state: &mut Self, _: &WlCallback, _: wayland_client::protocol::wl_callback::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         state.frame_callback = None;
-        let has_pending = state.found_paths.lock().map(|g| !g.is_empty()).unwrap_or(false);
-        if state.needs_render || has_pending {
+        if state.needs_render {
             state.needs_render = false;
             state.render(qh);
         }
