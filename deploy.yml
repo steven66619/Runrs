@@ -1,0 +1,33 @@
+name: Deploy Documentation
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdBook
+        run: |
+          mkdir bin
+          curl -sSL https://github.com | tar -xz -C bin
+          echo "$GITHUB_WORKSPACE/bin" >> $GITHUB_PATH
+      - name: Create Docs Structure
+        run: |
+          if [ ! -d "src_docs" ]; then
+            mkdir src_docs
+            echo -e '[book]\ntitle = "Launcher Guide"' > src_docs/book.toml
+            echo -e '# Installation\n\nRun `yay -S launcher-wayland-git`' > src_docs/src/SUMMARY.md
+            echo -e '# Welcome\n\nThis is the custom Wayland launcher documentation.' > src_docs/src/README.md
+          fi
+      - name: Build Website
+        run: bin/mdbook build src_docs
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./src_docs/book
+
