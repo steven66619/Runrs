@@ -316,6 +316,10 @@ impl WaylandState {
             }
         }
 
+        let any_missing = self.entries.iter().any(|e|
+            e.icon_key.is_some() && e.icon_path.is_none() && e.icon_surface.is_none()
+        );
+
         let cairo_surface = match self.cairo_surface.as_ref() { Some(s) => s, _ => return };
         let shm_pool = match self.shm_pool.as_ref() { Some(p) => p, _ => return };
         let surface = match self.surface.as_ref() { Some(s) => s, _ => return };
@@ -430,6 +434,10 @@ impl WaylandState {
         let callback = surface.frame(qh, ());
         self.frame_callback = Some(callback);
 
+        if any_missing {
+            self.needs_render = true;
+        }
+
         surface.attach(Some(&shm_pool.buffer), 0, 0);
         surface.damage_buffer(0, 0, w, h);
         surface.commit();
@@ -458,7 +466,8 @@ impl Dispatch<WlSurface, ()> for WaylandState { fn event(_: &mut Self, _: &WlSur
 impl Dispatch<WlCallback, ()> for WaylandState {
     fn event(state: &mut Self, _: &WlCallback, _: wayland_client::protocol::wl_callback::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         state.frame_callback = None;
-        if state.needs_render {
+        let has_pending = state.found_paths.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        if state.needs_render || has_pending {
             state.needs_render = false;
             state.render(qh);
         }
