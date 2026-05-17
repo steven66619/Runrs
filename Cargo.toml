@@ -6,14 +6,15 @@ edition = "2021"
 [dependencies]
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.2.0", features = ["client"] }
-cairo-rs = { version = "0.19", features = ["use_glib", "png"] }
-pango = "0.19"
-pangocairo = "0.19"
+cairo-rs = { version = "0.22", features = ["use_glib", "png"] }
+pango = "0.22"
+pangocairo = "0.22"
 memmap2 = "0.9"
 xkbcommon = "0.7"
 xkeysym = "0.2"
 freedesktop-desktop-entry = "0.2"
 freedesktop-icons = "0.4"
 libc = "0.2"
+librsvg = "2.62"
 
 
