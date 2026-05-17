@@ -1,16 +1,19 @@
 [package]
-name = "launcher"
-version = "1.0.0"
+name = "launcher-wayland"
+version = "1.0.3"
 edition = "2021"
 
 [dependencies]
 wayland-client = "0.31"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-cairo-rs = { version = "0.22", features = ["png", "use_glib"] }
-pango = "0.22"
-pangocairo = "0.22"
-xkbcommon = { version = "0.9", default-features = false, features = ["wayland"] }
-xkeysym = "0.2"
+wayland-protocols-wlr = { version = "0.2.0", features = ["client"] }
+cairo-rs = { version = "0.19", features = ["use_glib", "png"] }
+pango = "0.19"
+pangocairo = "0.19"
 memmap2 = "0.9"
-glib = "0.22"
+xkbcommon = "0.7"
+xkeysym = "0.2"
+freedesktop-desktop-entry = "0.2"
+freedesktop-icons = "0.4"
 libc = "0.2"
+
+

@@ -1,11 +1,13 @@
-use std::ffi::{CStr, CString};
-use std::fs;
+use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::path::Path;
-use std::ptr;
+use std::process::Command;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle,
+    Connection, Dispatch, QueueHandle, WEnum,
     protocol::{
         wl_buffer::WlBuffer,
         wl_compositor::WlCompositor,
@@ -15,7 +17,8 @@ use wayland_client::{
         wl_seat::{self, WlSeat, Capability},
         wl_shm::{WlShm, Format},
         wl_shm_pool::WlShmPool,
-        wl_surface::{self, WlSurface},
+        wl_surface::WlSurface,
+        wl_callback::WlCallback,
     },
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
@@ -24,1035 +27,566 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 use xkbcommon::xkb;
-use xkeysym::Keysym;
+use xkeysym::key;
 
 use cairo::{Context, Format as CairoFormat, ImageSurface};
-use memmap2::MmapMut;
+
+// Only pull system target paths from the freedesktop utility crate
+use freedesktop_desktop_entry::{default_paths, Iter};
 
 const MAX_ENTRIES: usize = 512;
-const ICON_SIZE: i32 = 28;
 const ROW_HEIGHT: i32 = 40;
 const SEARCH_H: i32 = 36;
 const PAD: i32 = 10;
+const ICON_SIZE: i32 = 24;
 
-mod rsvg_ffi {
-    use std::ffi::CString;
-    use std::os::raw::{c_char, c_double, c_int};
-    use std::path::Path;
-    use std::ptr;
-
-    #[repr(C)]
-    struct RsvgRectangle {
-        x: c_double,
-        y: c_double,
-        w: c_double,
-        h: c_double,
-    }
-
-    #[link(name = "rsvg-2")]
-    extern "C" {
-        fn rsvg_handle_new_from_file(
-            path: *const c_char,
-            err: *mut *mut libc::c_void,
-        ) -> *mut libc::c_void;
-        fn rsvg_handle_render_document(
-            handle: *mut libc::c_void,
-            cr: *mut libc::c_void,
-            viewport: *const RsvgRectangle,
-            err: *mut *mut libc::c_void,
-        ) -> c_int;
-        fn g_object_unref(object: *mut libc::c_void);
-    }
-
-    pub fn load_svg(path: &Path, size: i32) -> Option<crate::ImageSurface> {
-        let cpath = CString::new(path.to_str()?).ok()?;
-        unsafe {
-            let handle = rsvg_handle_new_from_file(cpath.as_ptr(), ptr::null_mut());
-            if handle.is_null() {
-                return None;
-            }
-
-            let surface =
-                crate::ImageSurface::create(crate::CairoFormat::ARgb32, size, size).ok()?;
-            let cr = crate::Context::new(&surface).ok()?;
-            let raw_cr = cr.to_raw_none().cast::<libc::c_void>();
-
-            let viewport = RsvgRectangle {
-                x: 0.0,
-                y: 0.0,
-                w: size as f64,
-                h: size as f64,
-            };
-
-            let ok = rsvg_handle_render_document(handle, raw_cr, &viewport, ptr::null_mut());
-            g_object_unref(handle);
-            drop(cr);
-            if ok == 0 {
-                return None;
-            }
-            Some(surface)
-        }
-    }
-}
-
+#[derive(Clone, Debug)]
 struct Entry {
     name: String,
     exec: String,
-    icon: Option<ImageSurface>,
+    icon_key: Option<String>,
+    icon_path: Option<PathBuf>,          
+    icon_surface: Option<ImageSurface>,  
 }
 
 struct ShmPool {
     buffer: WlBuffer,
-    _mmap: MmapMut,
+    _mmap: memmap2::MmapMut,
 }
 
 struct WaylandState {
     running: bool,
     width: i32,
     height: i32,
-
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
     seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
-
     surface: Option<WlSurface>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
-    configured: bool,
-
+    _configured: bool,
     shm_pool: Option<ShmPool>,
-
-    xkb_ctx: Option<xkb::Context>,
+    _xkb_ctx: Option<xkb::Context>,
     xkb_state: Option<xkb::State>,
-
-    entries: Vec<Entry>,
+    entries: Vec<Entry>,                 
     filtered: Vec<usize>,
     scroll_offset: usize,
     search: String,
     hovered_idx: Option<usize>,
-
     cairo_surface: Option<ImageSurface>,
-    cr: Option<Context>,
+    needs_render: bool,
+    first_configure_done: bool,
+    frame_callback: Option<WlCallback>,
+    found_paths: Arc<Mutex<Vec<(usize, PathBuf)>>>,
+}
+
+// Deep structural folder walker optimized for CachyOS and Arch theme directories
+fn find_icon_path(icon_name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(icon_name);
+    if path.is_absolute() && path.exists() {
+        return Some(path);
+    }
+
+    let mut base_roots = vec![
+        PathBuf::from("/usr/share/icons"),
+        PathBuf::from("/usr/share/pixmaps"),
+        PathBuf::from("/usr/local/share/icons"),
+    ];
+
+    if let Ok(home) = std::env::var("HOME") {
+        base_roots.push(PathBuf::from(format!("{}/.local/share/icons", home)));
+        base_roots.push(PathBuf::from(format!("{}/.icons", home)));
+    }
+
+    let target_lower = icon_name.to_lowercase();
+
+    for root in base_roots {
+        if !root.exists() { continue; }
+        if let Some(found) = check_dir_recursive(&root, &target_lower) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn check_dir_recursive(dir: &PathBuf, target_lower: &str) -> Option<PathBuf> {
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut sub_dirs = Vec::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                sub_dirs.push(p);
+            } else if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if stem.to_lowercase() == target_lower {
+                    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                        let ext_lower = ext.to_lowercase();
+                        // Accepts modern bitmaps as well as structural vector images natively
+                        if ext_lower == "png" || ext_lower == "svg" {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+        for sub in sub_dirs {
+            if let Some(found) = check_dir_recursive(&sub, target_lower) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn draw_rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -90.0_f64.to_radians(), 0.0_f64.to_radians());
+    cr.arc(x + w - r, y + h - r, r, 0.0_f64.to_radians(), 90.0_f64.to_radians());
+    cr.arc(x + r, y + h - r, r, 90.0_f64.to_radians(), 180.0_f64.to_radians());
+    cr.arc(x + r, y + r, r, 180.0_f64.to_radians(), 270.0_f64.to_radians());
+    cr.close_path();
 }
 
 impl WaylandState {
     fn new() -> Self {
-        WaylandState {
-            running: true,
-            width: 600,
-            height: 400,
-            compositor: None,
-            shm: None,
-            layer_shell: None,
-            seat: None,
-            pointer: None,
-            keyboard: None,
-            surface: None,
-            layer_surface: None,
-            configured: false,
-            shm_pool: None,
-            xkb_ctx: None,
-            xkb_state: None,
-            entries: Vec::new(),
-            filtered: Vec::new(),
-            scroll_offset: 0,
-            search: String::new(),
-            hovered_idx: None,
-            cairo_surface: None,
-            cr: None,
+        let mut state = WaylandState {
+            running: true, width: 600, height: 400,
+            compositor: None, shm: None, layer_shell: None, seat: None,
+            pointer: None, keyboard: None, surface: None, layer_surface: None,
+            _configured: false, shm_pool: None, _xkb_ctx: None, xkb_state: None,
+            entries: Vec::new(), filtered: Vec::new(), scroll_offset: 0,
+            search: String::new(), hovered_idx: None, cairo_surface: None,
+            needs_render: false, first_configure_done: false,
+            frame_callback: None,
+            found_paths: Arc::new(Mutex::new(Vec::new())),
+        };
+        
+        state.scan_system_applications();
+        state.update_filter();
+        state
+    }
+
+    fn scan_system_applications(&mut self) {
+        let mut loaded = Vec::new();
+
+        // FIXED: Universal hand-rolled line crawler completely avoids crate API parsing blocks
+        for path_entry in Iter::new(default_paths()) {
+            let file_path = &path_entry.1;
+            if let Ok(content) = fs::read_to_string(file_path) {
+                let mut name = None;
+                let mut exec = None;
+                let mut icon_key = None;
+                let mut no_display = false;
+
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.starts_with("NoDisplay=true") {
+                        no_display = true;
+                    } else if line.starts_with("Name=") && name.is_none() {
+                        name = Some(line.replacen("Name=", "", 1).to_string());
+                    } else if line.starts_with("Exec=") && exec.is_none() {
+                        let full_exec = line.replacen("Exec=", "", 1);
+                        // Clean trailing utility variables like %U, %f from shortcuts
+                        let clean_exec = full_exec.split('%').next().unwrap_or("").trim().to_string();
+                        exec = Some(clean_exec);
+                    } else if line.starts_with("Icon=") && icon_key.is_none() {
+                        icon_key = Some(line.replacen("Icon=", "", 1).to_string());
+                    }
+                }
+
+                if !no_display {
+                    if let (Some(n), Some(e)) = (name, exec) {
+                        if !e.is_empty() {
+                            loaded.push(Entry {
+                                name: n,
+                                exec: e,
+                                icon_key,
+                                icon_path: None,
+                                icon_surface: None,
+                            });
+                        }
+                    }
+                }
+            }
         }
+        
+        loaded.sort_by(|a, b| a.name.cmp(&b.name));
+        loaded.dedup_by(|a, b| a.exec == b.exec);
+        self.entries = loaded;
+
+        let keys_to_load: Vec<(usize, String)> = self.entries.iter().enumerate()
+            .filter_map(|(i, entry)| entry.icon_key.clone().map(|key| (i, key)))
+            .collect();
+
+        let found_paths_worker = Arc::clone(&self.found_paths);
+
+        thread::spawn(move || {
+            for (idx, key) in keys_to_load {
+                if let Some(img_path) = find_icon_path(&key) {
+                    if let Ok(mut guard) = found_paths_worker.lock() {
+                        guard.push((idx, img_path));
+                    }
+                }
+            }
+        });
     }
 
     fn update_filter(&mut self) {
         self.filtered.clear();
         self.scroll_offset = 0;
         let search_lower = self.search.to_lowercase();
+        
         for (i, entry) in self.entries.iter().enumerate() {
-            if self.search.is_empty()
-                || entry.name.to_lowercase().contains(&search_lower)
+            if self.search.is_empty() 
+                || entry.name.to_lowercase().contains(&search_lower) 
+                || entry.exec.to_lowercase().contains(&search_lower) 
             {
                 self.filtered.push(i);
-                if self.filtered.len() >= MAX_ENTRIES {
-                    break;
+                if self.filtered.len() >= MAX_ENTRIES { break; }
+            }
+        }
+        self.hovered_idx = if !self.filtered.is_empty() { Some(0) } else { None };
+    }
+
+    fn launch_selected(&mut self) {
+        if let Some(idx) = self.hovered_idx {
+            if idx < self.filtered.len() {
+                let entry_idx = self.filtered[idx];
+                let target_app = &self.entries[entry_idx];
+
+                let clean_command = target_app.exec
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .replace('"', "");
+
+                if !clean_command.is_empty() {
+                    let _ = Command::new(clean_command).spawn(); 
                 }
+                self.running = false; 
             }
         }
     }
 
     fn create_shm_pool(&mut self, qh: &QueueHandle<Self>) {
-        let shm = match &self.shm {
-            Some(s) => s,
-            None => return,
-        };
+        let shm = match &self.shm { Some(s) => s, None => return };
         let width = self.width;
         let height = self.height;
-        let stride = match CairoFormat::ARgb32.stride_for_width(width as u32) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+        let stride = match CairoFormat::ARgb32.stride_for_width(width as u32) { Ok(s) => s, Err(_) => return };
         let size = (stride * height) as u64;
 
         let name = CString::new("launcher").unwrap();
         let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        if raw_fd < 0 {
-            return;
-        }
+        if raw_fd < 0 { return; }
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), size as i64) } < 0 {
-            return;
-        }
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), size as i64) } < 0 { return; }
 
-        let mmap = match unsafe { MmapMut::map_mut(&fd) } {
-            Ok(m) => m,
-            Err(_) => return,
-        };
+        let mut mmap = match unsafe { memmap2::MmapMut::map_mut(&fd) } { Ok(m) => m, Err(_) => return };
         let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
         let buffer = pool.create_buffer(0, width, height, stride, Format::Argb8888, qh, ());
         drop(pool);
 
-        let cairo_surface = match ImageSurface::create(CairoFormat::ARgb32, width, height) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let cr = match Context::new(&cairo_surface) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+        let ptr = mmap.as_mut_ptr();
+        let len = mmap.len();
+        let static_slice: &'static mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
 
-        self.cairo_surface = Some(cairo_surface);
-        self.cr = Some(cr);
-        self.shm_pool = Some(ShmPool {
-            buffer,
-            _mmap: mmap,
-        });
+        let cairo_surface = ImageSurface::create_for_data(
+            static_slice,
+            CairoFormat::ARgb32,
+            width,
+            height,
+            stride,
+        ).ok();
+
+        self.cairo_surface = cairo_surface;
+        self.shm_pool = Some(ShmPool { buffer, _mmap: mmap });
     }
 
-    fn render(&mut self) {
-        let cr = match self.cr.as_mut() {
-            Some(c) => c,
-            _ => return,
-        };
-        let cairo_surface = match self.cairo_surface.as_mut() {
-            Some(s) => s,
-            _ => return,
-        };
-        let shm_pool = match self.shm_pool.as_mut() {
-            Some(p) => p,
-            _ => return,
-        };
-        let surface = match self.surface.as_ref() {
-            Some(s) => s,
-            _ => return,
-        };
+    fn render(&mut self, qh: &QueueHandle<Self>) {
+        if !self.first_configure_done { return; }
+        if self.frame_callback.is_some() { return; }
+
+        if let Ok(mut guard) = self.found_paths.lock() {
+            while let Some((idx, path)) = guard.pop() {
+                if idx < self.entries.len() {
+                    self.entries[idx].icon_path = Some(path);
+                }
+            }
+        }
+
+        let cairo_surface = match self.cairo_surface.as_ref() { Some(s) => s, _ => return };
+        let shm_pool = match self.shm_pool.as_ref() { Some(p) => p, _ => return };
+        let surface = match self.surface.as_ref() { Some(s) => s, _ => return };
         let w = self.width;
         let h = self.height;
+
+        let cr = match Context::new(cairo_surface) { Ok(c) => c, Err(_) => return };
 
         cr.set_operator(cairo::Operator::Clear);
         cr.paint().ok();
         cr.set_operator(cairo::Operator::Over);
 
-        draw_rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, 8.0);
+        draw_rounded_rect(&cr, 0.0, 0.0, w as f64, h as f64, 8.0);
         cr.set_source_rgba(0.04, 0.03, 0.10, 0.96);
         cr.fill().ok();
 
         cr.set_source_rgba(0.0, 0.90, 1.0, 0.25);
         cr.set_line_width(1.0);
-        draw_rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, 8.0);
+        draw_rounded_rect(&cr, 0.0, 0.0, w as f64, h as f64, 8.0);
         cr.stroke().ok();
 
         let sbx = PAD as f64;
         let sbw = (w - PAD * 2) as f64;
-        draw_rounded_rect(cr, sbx, 8.0, sbw, SEARCH_H as f64, 6.0);
+        draw_rounded_rect(&cr, sbx, 8.0, sbw, SEARCH_H as f64, 6.0);
         cr.set_source_rgba(0.08, 0.06, 0.18, 0.9);
         cr.fill().ok();
         cr.set_source_rgba(0.0, 0.90, 1.0, 0.4);
         cr.set_line_width(1.0);
-        draw_rounded_rect(cr, sbx, 8.0, sbw, SEARCH_H as f64, 6.0);
+        draw_rounded_rect(&cr, sbx, 8.0, sbw, SEARCH_H as f64, 6.0);
         cr.stroke().ok();
 
-        let disp = if self.search.is_empty() {
-            "  Type to search...".to_string()
-        } else {
-            format!("  {}_", self.search)
-        };
+        let disp = if self.search.is_empty() { "  Type to search...".to_string() } else { format!("  {}_", self.search) };
 
         let fd_s = pango::FontDescription::from_string("Sans 12");
-        let pango_ctx = pangocairo::functions::create_context(cr);
+        let pango_ctx = pangocairo::functions::create_context(&cr);
         let lay_s = pango::Layout::new(&pango_ctx);
         lay_s.set_font_description(Some(&fd_s));
         lay_s.set_text(&disp);
-        let (_stw, sth) = lay_s.pixel_size();
-        cr.set_source_rgb(0.7, 0.75, 1.0);
-        cr.move_to(sbx + 4.0, 8.0 + (SEARCH_H - sth) as f64 / 2.0);
-        pangocairo::functions::show_layout(cr, &lay_s);
-        drop(lay_s);
+        cr.move_to(sbx + 4.0, 8.0 + (SEARCH_H as f64 - 18.0) / 2.0);
+        cr.set_source_rgba(0.0, 0.9, 1.0, 1.0);
+        pangocairo::functions::show_layout(&cr, &lay_s);
 
-        let n_results_total = self.filtered.len();
-        let max_visible = ((h - SEARCH_H - 8 - 4) / ROW_HEIGHT) as usize;
-        let n_visible = n_results_total.min(max_visible);
-        let skip = self.scroll_offset;
+        let start_y = 8.0 + (SEARCH_H as f64) + (PAD as f64);
+        let max_visible = (((h as f64) - start_y) / ROW_HEIGHT as f64) as usize;
 
-        let fd_n = pango::FontDescription::from_string("Sans 12");
-        let fd_sub = pango::FontDescription::from_string("Monospace 9");
-        let ctx_n = pangocairo::functions::create_context(cr);
-
-        for j in 0..n_visible {
-            let idx = skip + j;
-            if idx >= self.filtered.len() {
-                break;
+        for idx in 0..max_visible {
+            let filtered_idx = idx + self.scroll_offset;
+            if filtered_idx >= self.filtered.len() { break; }
+            let entry_idx = self.filtered[filtered_idx];
+            
+            // AUTOMATED CAIRO BITMAP LOADER
+            if self.entries[entry_idx].icon_surface.is_none() {
+                if let Some(ref path) = self.entries[entry_idx].icon_path {
+                    if let Ok(file) = fs::File::open(path) {
+                        if let Ok(surface) = ImageSurface::create_from_png(&mut std::io::BufReader::new(file)) {
+                            self.entries[entry_idx].icon_surface = Some(surface);
+                        }
+                    }
+                }
             }
-            let i = self.filtered[idx];
-            let ry = (SEARCH_H + 8 + 4 + j as i32 * ROW_HEIGHT) as f64;
-            let hovered = self.hovered_idx.map_or(false, |h| h == i);
 
-            if hovered {
-                cr.set_source_rgba(0.0, 0.90, 1.0, 0.12);
-                draw_rounded_rect(cr, 2.0, ry, (w - 4) as f64, (ROW_HEIGHT - 2) as f64, 6.0);
+            let entry = &self.entries[entry_idx];
+            let row_y = start_y + (idx as f64 * ROW_HEIGHT as f64);
+
+            if self.hovered_idx == Some(filtered_idx) {
+                draw_rounded_rect(&cr, sbx, row_y, sbw, ROW_HEIGHT as f64, 4.0);
+                cr.set_source_rgba(0.0, 0.9, 1.0, 0.15);
                 cr.fill().ok();
             }
 
-            if let Some(ref icon) = self.entries[i].icon {
-                let iw = icon.width() as f64;
-                let ih = icon.height() as f64;
-                let scale = if iw > ih {
-                    ICON_SIZE as f64 / iw
-                } else {
-                    ICON_SIZE as f64 / ih
-                };
-                let dx = (PAD + 2) as f64;
-                let dy = ry + (ROW_HEIGHT as f64 - ih * scale) / 2.0;
-                let _ = cr.save();
-                cr.translate(dx, dy);
-                cr.scale(scale, scale);
-                let _ = cr.set_source_surface(icon, 0.0, 0.0);
-                cr.paint().ok();
-                let _ = cr.restore();
-            } else {
-                cr.set_source_rgba(0.0, 0.45, 0.5, 0.5);
-                let cx = (PAD + 2 + ICON_SIZE / 2) as f64;
-                let cy = ry + ROW_HEIGHT as f64 / 2.0;
-                cr.arc(
-                    cx,
-                    cy,
-                    (ICON_SIZE / 2 - 2) as f64,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                );
+            let mut text_offset = 12.0;
+            if let Some(ref icon) = entry.icon_surface {
+                cr.save().ok();
+                let icon_x = sbx + PAD as f64 + 6.0;
+                let icon_y = row_y + ((ROW_HEIGHT - ICON_SIZE) / 2) as f64;
+                
+                cr.set_source_surface(icon, icon_x, icon_y).ok();
+                cr.rectangle(icon_x, icon_y, ICON_SIZE as f64, ICON_SIZE as f64);
                 cr.fill().ok();
+                cr.restore().ok();
+                
+                text_offset += (ICON_SIZE + 10) as f64;
             }
 
-            let tx = (PAD + 2 + ICON_SIZE + 10) as f64;
-            let lay_n = pango::Layout::new(&ctx_n);
-            lay_n.set_font_description(Some(&fd_n));
-            lay_n.set_text(&self.entries[i].name);
-            let (_, nh) = lay_n.pixel_size();
-            cr.set_source_rgb(0.9, 0.92, 1.0);
-            cr.move_to(tx, ry + (ROW_HEIGHT as f64 - nh as f64) / 2.0);
-            pangocairo::functions::show_layout(cr, &lay_n);
-            drop(lay_n);
-
-            if !self.entries[i].exec.is_empty() {
-                let ex_w = (w as f64 - tx - PAD as f64) as i32;
-                let lay_sub = pango::Layout::new(&ctx_n);
-                lay_sub.set_font_description(Some(&fd_sub));
-                lay_sub.set_text(&self.entries[i].exec);
-                lay_sub.set_width(ex_w * pango::SCALE);
-                lay_sub.set_ellipsize(pango::EllipsizeMode::Middle);
-                lay_sub.set_alignment(pango::Alignment::Right);
-                let (_, sh) = lay_sub.pixel_size();
-                cr.set_source_rgba(0.5, 0.55, 0.7, 0.6);
-                cr.move_to(tx, ry + (ROW_HEIGHT as f64 - sh as f64) / 2.0);
-                pangocairo::functions::show_layout(cr, &lay_sub);
-                drop(lay_sub);
-
-                cr.set_source_rgba(0.0, 0.90, 1.0, 0.1);
-                cr.set_line_width(0.5);
-                cr.move_to(PAD as f64, ry + ROW_HEIGHT as f64 - 1.0);
-                cr.line_to((w - PAD) as f64, ry + ROW_HEIGHT as f64 - 1.0);
-                cr.stroke().ok();
-            }
+            let text_layout = pango::Layout::new(&pango_ctx);
+            text_layout.set_font_description(Some(&fd_s));
+            text_layout.set_text(&entry.name);
+            cr.move_to(sbx + PAD as f64 + text_offset, row_y + ((ROW_HEIGHT - 18) / 2) as f64);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+            pangocairo::functions::show_layout(&cr, &text_layout);
         }
 
+        drop(cr);
         cairo_surface.flush();
-        if let Ok(data) = cairo_surface.data() {
-            let mmap = &mut shm_pool._mmap;
-            let len = data.len().min(mmap.len());
-            mmap[..len].copy_from_slice(&data[..len]);
-        }
+
+        let callback = surface.frame(qh, ());
+        self.frame_callback = Some(callback);
 
         surface.attach(Some(&shm_pool.buffer), 0, 0);
         surface.damage_buffer(0, 0, w, h);
         surface.commit();
     }
-
-    fn execute_command(cmd: &str) {
-        std::process::Command::new("sh")
-            .args(["-c", cmd])
-            .spawn()
-            .ok();
-    }
-}
-
-fn draw_rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    let r = r.min(h / 2.0).min(w / 2.0);
-    cr.move_to(x + r, y);
-    cr.line_to(x + w - r, y);
-    cr.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
-    cr.line_to(x + w, y + h - r);
-    cr.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
-    cr.line_to(x + r, y + h);
-    cr.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
-    cr.line_to(x, y + r);
-    cr.arc(x + r, y + r, r, std::f64::consts::PI, 3.0 * std::f64::consts::FRAC_PI_2);
-    cr.close_path();
-}
-
-fn read_desktop_field(content: &str, field: &str) -> Option<String> {
-    let pat = format!("\n{}=", field);
-    let start = content.find(&pat)?;
-    let val_start = start + pat.len();
-    let val = content[val_start..]
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if val.is_empty() { None } else { Some(val) }
-}
-
-fn clean_exec(exec: &str) -> String {
-    let mut out = String::with_capacity(exec.len());
-    let mut chars = exec.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' && chars.peek().is_some() {
-            chars.next();
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn load_png(base: &str, name: &str) -> Option<ImageSurface> {
-    let path = format!("{}/{}.png", base, name);
-    let mut file = fs::File::open(&path).ok()?;
-    ImageSurface::create_from_png(&mut file).ok()
-}
-
-fn load_svg(base: &str, name: &str, size: i32) -> Option<ImageSurface> {
-    let path = format!("{}/{}.svg", base, name);
-    rsvg_ffi::load_svg(Path::new(&path), size)
-}
-
-const ICON_THEMES: &[&str] = &[
-    "hicolor",
-    "Papirus",
-    "Papirus-Dark",
-    "Papirus-Light",
-    "Adwaita",
-    "gnome",
-    "breeze",
-    "breeze-dark",
-    "Numix",
-    "elementary-xfce",
-    "Moka",
-    "Faenza",
-    "Humanity",
-    "ubuntu-mono",
-];
-
-fn load_icon(name: &str) -> Option<ImageSurface> {
-    if name.is_empty() {
-        return None;
-    }
-    let sizes = [48, 64, 32, 128, 96, 72];
-    for theme in ICON_THEMES {
-        for size in &sizes {
-            let base = format!("/usr/share/icons/{theme}/{size}x{size}/apps");
-            if Path::new(&format!("{base}/{}.png", name)).exists() {
-                if let Some(img) = load_png(&base, name) {
-                    return Some(img);
-                }
-            }
-        }
-        let base = format!("/usr/share/icons/{theme}/scalable/apps");
-        if let Some(img) = load_svg(&base, name, 48) {
-            return Some(img);
-        }
-    }
-    load_png("/usr/share/pixmaps", name)
-}
-
-fn populate_entries() -> Vec<Entry> {
-    let mut entries = Vec::new();
-    let dir = match fs::read_dir("/usr/share/applications") {
-        Ok(d) => d,
-        Err(_) => return entries,
-    };
-
-    for entry in dir {
-        let entry = match entry {
-            Ok(e) => e,
-            _ => continue,
-        };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().map_or(true, |e| e != "desktop") {
-            continue;
-        }
-
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => format!("\n{}", c),
-            Err(_) => continue,
-        };
-
-        let hidden = read_desktop_field(&content, "NoDisplay")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-            || read_desktop_field(&content, "Hidden")
-                .map(|v| v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-        if hidden {
-            continue;
-        }
-
-        let type_field = read_desktop_field(&content, "Type");
-        if type_field.as_deref() != Some("Application") {
-            continue;
-        }
-
-        let name = read_desktop_field(&content, "Name");
-        let exec = read_desktop_field(&content, "Exec");
-        let icon = read_desktop_field(&content, "Icon");
-
-        if let (Some(name), Some(exec)) = (name, exec) {
-            if name.is_empty() || exec.is_empty() {
-                continue;
-            }
-            let icon_name = icon.unwrap_or_default();
-            let icon_surface = load_icon(&icon_name);
-            entries.push(Entry {
-                name,
-                exec: clean_exec(&exec),
-                icon: icon_surface,
-            });
-            if entries.len() >= MAX_ENTRIES {
-                break;
-            }
-        }
-    }
-    entries
 }
 
 impl Dispatch<WlRegistry, ()> for WaylandState {
-    fn event(
-        state: &mut Self,
-        registry: &WlRegistry,
-        event: <WlRegistry as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
+    fn event(state: &mut Self, registry: &WlRegistry, event: wl_registry::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
             match interface.as_str() {
-                "wl_compositor" => {
-                    state.compositor =
-                        Some(registry.bind::<WlCompositor, _, _>(name, version.min(4), qh, ()));
-                }
-                "wl_shm" => {
-                    state.shm = Some(registry.bind::<WlShm, _, _>(name, version.min(1), qh, ()));
-                }
-                "zwlr_layer_shell_v1" => {
-                    state.layer_shell = Some(registry.bind::<ZwlrLayerShellV1, _, _>(
-                        name,
-                        version.min(4),
-                        qh,
-                        (),
-                    ));
-                }
-                "wl_seat" => {
-                    state.seat =
-                        Some(registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ()));
-                }
+                "wl_compositor" => state.compositor = Some(registry.bind::<WlCompositor, _, _>(name, version, qh, ())),
+                "wl_shm" => state.shm = Some(registry.bind::<WlShm, _, _>(name, version, qh, ())),
+                "zwlr_layer_shell_v1" => state.layer_shell = Some(registry.bind::<ZwlrLayerShellV1, _, _>(name, version, qh, ())),
+                "wl_seat" => state.seat = Some(registry.bind::<WlSeat, _, _>(name, version, qh, ())),
                 _ => {}
             }
         }
     }
 }
 
-impl Dispatch<WlCompositor, ()> for WaylandState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &WlCompositor,
-        _event: <WlCompositor as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
+impl Dispatch<WlCompositor, ()> for WaylandState { fn event(_: &mut Self, _: &WlCompositor, _: wayland_client::protocol::wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
+impl Dispatch<WlShm, ()> for WaylandState { fn event(_: &mut Self, _: &WlShm, _: wayland_client::protocol::wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
+impl Dispatch<WlShmPool, ()> for WaylandState { fn event(_: &mut Self, _: &WlShmPool, _: wayland_client::protocol::wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
+impl Dispatch<WlBuffer, ()> for WaylandState { fn event(_: &mut Self, _: &WlBuffer, _: wayland_client::protocol::wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
+impl Dispatch<WlSurface, ()> for WaylandState { fn event(_: &mut Self, _: &WlSurface, _: wayland_client::protocol::wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
+impl Dispatch<WlCallback, ()> for WaylandState {
+    fn event(state: &mut Self, _: &WlCallback, _: wayland_client::protocol::wl_callback::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        state.frame_callback = None;
+        if state.needs_render {
+            state.needs_render = false;
+            state.render(qh);
+        }
     }
 }
 
-impl Dispatch<WlShm, ()> for WaylandState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &WlShm,
-        _event: <WlShm as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<WlShmPool, ()> for WaylandState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &WlShmPool,
-        _event: <WlShmPool as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<WlBuffer, ()> for WaylandState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &WlBuffer,
-        _event: <WlBuffer as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_surface::WlSurface,
-        _event: <wl_surface::WlSurface as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &ZwlrLayerShellV1,
-        _event: <ZwlrLayerShellV1 as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
+impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState { fn event(_: &mut Self, _: &ZwlrLayerShellV1, _: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandState {
-    fn event(
-        state: &mut Self,
-        _proxy: &ZwlrLayerSurfaceV1,
-        event: <ZwlrLayerSurfaceV1 as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
+    fn event(state: &mut Self, surface: &ZwlrLayerSurfaceV1, event: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         match event {
-            zwlr_layer_surface_v1::Event::Configure {
-                serial, width, height, ..
-            } => {
-                let ls = state.layer_surface.as_ref().unwrap().clone();
-                ls.ack_configure(serial);
-                if width > 0 && height > 0 {
-                    state.width = width as i32;
-                    state.height = height as i32;
-                }
-                if state.shm_pool.is_none() {
-                    state.create_shm_pool(qh);
-                    state.render();
-                }
-                state.configured = true;
-            }
-            zwlr_layer_surface_v1::Event::Closed => {
-                state.running = false;
-            }
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                surface.ack_configure(serial);
+                state.width = if width > 0 { width as i32 } else { 600 };
+                state.height = if height > 0 { height as i32 } else { 400 };
+                state.create_shm_pool(qh);
+                state.first_configure_done = true;
+                state.render(qh);
+            },
+            zwlr_layer_surface_v1::Event::Closed => { state.running = false; },
             _ => {}
         }
     }
 }
 
 impl Dispatch<WlSeat, ()> for WaylandState {
-    fn event(
-        state: &mut Self,
-        _proxy: &WlSeat,
-        event: <WlSeat as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities { capabilities, .. } = event {
-            match capabilities {
-                wayland_client::WEnum::Value(caps) => {
-                    if caps.contains(Capability::Pointer) && state.pointer.is_none() {
-                        if let Some(ref seat) = state.seat {
-                            state.pointer = Some(seat.get_pointer(qh, ()));
-                        }
-                    } else if !caps.contains(Capability::Pointer) {
-                        state.pointer.take();
-                    }
-
-                    if caps.contains(Capability::Keyboard) && state.keyboard.is_none() {
-                        if let Some(ref seat) = state.seat {
-                            state.keyboard = Some(seat.get_keyboard(qh, ()));
-                        }
-                    } else if !caps.contains(Capability::Keyboard) {
-                        state.keyboard.take();
-                    }
-                }
-                _ => {}
+    fn event(state: &mut Self, seat: &WlSeat, event: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event {
+            if caps.contains(Capability::Keyboard) && state.keyboard.is_none() {
+                state.keyboard = Some(seat.get_keyboard(qh, ()));
             }
-        }
-    }
-}
-
-impl Dispatch<WlKeyboard, ()> for WaylandState {
-    fn event(
-        state: &mut Self,
-        _proxy: &WlKeyboard,
-        event: <WlKeyboard as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_keyboard::Event::Keymap { format, fd, size, .. } => {
-                match format {
-                    wayland_client::WEnum::Value(KeymapFormat::XkbV1) => {
-                        let ptr = unsafe {
-                            libc::mmap(
-                                ptr::null_mut(),
-                                size as usize,
-                                libc::PROT_READ,
-                                libc::MAP_PRIVATE,
-                                fd.as_raw_fd(),
-                                0,
-                            )
-                        };
-                        if ptr == libc::MAP_FAILED {
-                            return;
-                        }
-                        let map_str = unsafe {
-                            CStr::from_ptr(ptr as *const libc::c_char)
-                                .to_string_lossy()
-                                .to_string()
-                        };
-                        unsafe { libc::munmap(ptr, size as usize) };
-
-                        if let Some(ref ctx) = state.xkb_ctx {
-                            let keymap = xkb::Keymap::new_from_string(
-                                ctx,
-                                map_str,
-                                xkb::KEYMAP_FORMAT_TEXT_V1,
-                                0,
-                            );
-                            if let Some(keymap) = keymap {
-                                state.xkb_state = Some(xkb::State::new(&keymap));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            if caps.contains(Capability::Pointer) && state.pointer.is_none() {
+                state.pointer = Some(seat.get_pointer(qh, ()));
             }
-            wl_keyboard::Event::Key {
-                key, state: kstate, ..
-            } => {
-                let xkb_state = match &mut state.xkb_state {
-                    Some(s) => s,
-                    _ => return,
-                };
-                let keycode = xkb::Keycode::new(key);
-
-                let down = matches!(kstate, wayland_client::WEnum::Value(KeyState::Pressed));
-                xkb_state.update_key(
-                    keycode,
-                    if down {
-                        xkb::KeyDirection::Down
-                    } else {
-                        xkb::KeyDirection::Up
-                    },
-                );
-
-                if !down {
-                    return;
-                }
-
-                let sym = xkb_state.key_get_one_sym(keycode);
-
-                if sym == Keysym::new(0xFF1B) {
-                    state.running = false;
-                    return;
-                }
-                if sym == Keysym::new(0xFF0D) || sym == Keysym::new(0xFF8D) {
-                    let idx = state.hovered_idx.or_else(|| state.filtered.first().copied());
-                    if let Some(i) = idx {
-                        Self::execute_command(&state.entries[i].exec);
-                        state.running = false;
-                    }
-                    return;
-                }
-                if sym == Keysym::new(0xFF08) {
-                    if !state.search.is_empty() {
-                        state.search.pop();
-                    }
-                    state.update_filter();
-                    state.render();
-                    return;
-                }
-                if sym == Keysym::new(0xFF52) {
-                    if state.filtered.is_empty() {
-                        return;
-                    }
-                    let cur = state.hovered_idx.and_then(|h| {
-                        state.filtered.iter().position(|&x| x == h)
-                    });
-                    match cur {
-                        Some(c) if c > 0 => {
-                            state.hovered_idx = Some(state.filtered[c - 1]);
-                        }
-                        _ if state.scroll_offset > 0 => {
-                            state.scroll_offset -= 1;
-                            state.hovered_idx = Some(state.filtered[state.scroll_offset]);
-                        }
-                        _ => {}
-                    }
-                    state.render();
-                    return;
-                }
-                if sym == Keysym::new(0xFF54) {
-                    if state.filtered.is_empty() {
-                        return;
-                    }
-                    let cur = state.hovered_idx.and_then(|h| {
-                        state.filtered.iter().position(|&x| x == h)
-                    });
-                    let max_visible = ((state.height - SEARCH_H - 8 - 4) / ROW_HEIGHT) as usize;
-                    match cur {
-                        Some(c) if c < state.filtered.len() - 1 => {
-                            let new_idx = c + 1;
-                            state.hovered_idx = Some(state.filtered[new_idx]);
-                            if new_idx - state.scroll_offset >= max_visible {
-                                state.scroll_offset = new_idx - max_visible + 1;
-                            }
-                        }
-                        _ if state.scroll_offset + max_visible < state.filtered.len() => {
-                            state.scroll_offset += 1;
-                        }
-                        _ => {}
-                    }
-                    state.render();
-                    return;
-                }
-
-                let utf8 = xkb_state.key_get_utf8(keycode);
-                if !utf8.is_empty() {
-                    if let Some(c) = utf8.chars().next() {
-                        if !c.is_control() {
-                            state.search.push(c);
-                            state.update_filter();
-                            state.hovered_idx = state.filtered.first().copied();
-                            state.render();
-                        }
-                    }
-                }
-            }
-            wl_keyboard::Event::Modifiers {
-                mods_depressed,
-                mods_latched,
-                mods_locked,
-                group,
-                ..
-            } => {
-                if let Some(ref mut s) = state.xkb_state {
-                    s.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-                }
-            }
-            _ => {}
         }
     }
 }
 
 impl Dispatch<WlPointer, ()> for WaylandState {
-    fn event(
-        state: &mut Self,
-        _proxy: &WlPointer,
-        event: <WlPointer as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
+    fn event(state: &mut Self, _: &WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         match event {
-            wl_pointer::Event::Enter { .. } => {
-                state.hovered_idx = None;
-            }
-            wl_pointer::Event::Leave { .. } => {
-                if state.hovered_idx.take().is_some() {
-                    state.render();
-                }
-            }
-            wl_pointer::Event::Motion {
-                surface_y, ..
-            } => {
-                let old = state.hovered_idx;
-                state.hovered_idx = None;
-                let skip = state.scroll_offset;
-                let max_visible = ((state.height - SEARCH_H - 8 - 4) / ROW_HEIGHT) as usize;
-                let y = surface_y as i32;
-                for j in 0..max_visible {
-                    let idx = skip + j;
-                    if idx >= state.filtered.len() {
-                        break;
-                    }
-                    let ry = SEARCH_H + 8 + 4 + j as i32 * ROW_HEIGHT;
-                    if y >= ry && y < ry + ROW_HEIGHT {
-                        state.hovered_idx = Some(state.filtered[idx]);
-                        break;
+            wl_pointer::Event::Motion { surface_y, .. } => {
+                let start_y = 8.0 + (SEARCH_H as f64) + (PAD as f64);
+                if surface_y >= start_y {
+                    let click_idx = ((surface_y - start_y) / ROW_HEIGHT as f64) as usize + state.scroll_offset;
+                    if click_idx < state.filtered.len() {
+                        state.hovered_idx = Some(click_idx);
+                        state.render(qh);
                     }
                 }
-                if old != state.hovered_idx {
-                    state.render();
+            },
+            wl_pointer::Event::Button { state: WEnum::Value(ButtonState::Pressed), .. } => {
+                state.launch_selected();
+            },
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for WaylandState {
+    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        match event {
+            wl_keyboard::Event::Keymap { format: WEnum::Value(KeymapFormat::XkbV1), fd, size } => {
+                let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+                if let Ok(Some(device_keymap)) = unsafe {
+                    xkb::Keymap::new_from_fd(
+                        &context, fd, size as usize,
+                        xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS
+                    )
+                } {
+                    state.xkb_state = Some(xkb::State::new(&device_keymap));
                 }
-            }
-            wl_pointer::Event::Button {
-                button,
-                state: bstate,
-                ..
-            } => {
-                if !matches!(bstate, wayland_client::WEnum::Value(ButtonState::Pressed))
-                    || button != 0x110
-                {
-                    return;
+                state._xkb_ctx = Some(context);
+            },
+            wl_keyboard::Event::Key { key, state: WEnum::Value(KeyState::Pressed), .. } => {
+                if let Some(xkb_state) = &state.xkb_state {
+                    let sym = xkb_state.key_get_one_sym((key + 8).into());
+                    
+                    if sym == xkeysym::Keysym::from(key::Escape) {
+                        state.running = false;
+                    } else if sym == xkeysym::Keysym::from(key::Return) {
+                        state.launch_selected();
+                    } else if sym == xkeysym::Keysym::from(key::BackSpace) {
+                        state.search.pop();
+                        state.update_filter();
+                        state.render(qh);
+                    } else if sym == xkeysym::Keysym::from(key::Up) {
+                        if let Some(curr) = state.hovered_idx {
+                            if curr > 0 {
+                                state.hovered_idx = Some(curr - 1);
+                                if curr - 1 < state.scroll_offset { state.scroll_offset = curr - 1; }
+                                state.render(qh);
+                            }
+                        }
+                    } else if sym == xkeysym::Keysym::from(key::Down) {
+                        if let Some(curr) = state.hovered_idx {
+                            if curr + 1 < state.filtered.len() {
+                                state.hovered_idx = Some(curr + 1);
+                                let max_visible = ((state.height as f64 - (8.0 + SEARCH_H as f64 + PAD as f64)) / ROW_HEIGHT as f64) as usize;
+                                if curr + 1 >= state.scroll_offset + max_visible { state.scroll_offset += 1; }
+                                state.render(qh);
+                            }
+                        }
+                    } else {
+                        let txt = xkb_state.key_get_utf8((key + 8).into());
+                        if !txt.is_empty() && txt.chars().all(|c| !c.is_control()) {
+                            state.search.push_str(&txt);
+                            state.update_filter();
+                            state.render(qh);
+                        }
+                    }
                 }
-                if let Some(i) = state.hovered_idx {
-                    Self::execute_command(&state.entries[i].exec);
-                    state.running = false;
-                }
-            }
-            wl_pointer::Event::Axis { value, .. } => {
-                let delta = value as i32;
-                if delta == 0 {
-                    return;
-                }
-                let max_visible = ((state.height - SEARCH_H - 8 - 4) / ROW_HEIGHT) as usize;
-                let max_scroll = state.filtered.len().saturating_sub(max_visible);
-                let old = state.scroll_offset;
-                let new = (state.scroll_offset as i32 - delta)
-                    .max(0)
-                    .min(max_scroll as i32) as usize;
-                state.scroll_offset = new;
-                if old != state.scroll_offset {
-                    state.hovered_idx = None;
-                    state.render();
-                }
-            }
-            wl_pointer::Event::Frame => {}
+            },
             _ => {}
         }
     }
 }
 
 fn main() {
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
-
-    let conn = match Connection::connect_to_env() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to connect to wayland display: {:?}", e);
-            std::process::exit(1);
-        }
-    };
-
+    let conn = Connection::connect_to_env().expect("Failed to link into Wayland backend");
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
 
     let mut state = WaylandState::new();
-
     let _registry = conn.display().get_registry(&qh, ());
-    if event_queue.roundtrip(&mut state).is_err() {
-        eprintln!("failed to get globals");
-        std::process::exit(1);
-    }
 
-    if state.compositor.is_none() || state.shm.is_none() || state.layer_shell.is_none() {
-        eprintln!("missing required wayland globals");
-        std::process::exit(1);
-    }
+    event_queue.roundtrip(&mut state).unwrap();
+    event_queue.roundtrip(&mut state).unwrap();
 
-    state.xkb_ctx = Some(xkb::Context::new(xkb::CONTEXT_NO_FLAGS));
+    let compositor = state.compositor.as_ref().expect("wl_compositor missing");
+    let layer_shell = state.layer_shell.as_ref().expect("zwlr_layer_shell_v1 missing");
 
-    state.entries = populate_entries();
-    state.update_filter();
-
-    let compositor = state.compositor.as_ref().unwrap();
     let wl_surface = compositor.create_surface(&qh, ());
-    state.surface = Some(wl_surface);
+    let layer_surface = layer_shell.get_layer_surface(&wl_surface, None, Layer::Overlay, "launcher".to_string(), &qh, ());
 
-    let layer_shell = state.layer_shell.as_ref().unwrap();
-    let layer_surface = layer_shell.get_layer_surface(
-        state.surface.as_ref().unwrap(),
-        None,
-        Layer::Overlay,
-        "launcher".to_string(),
-        &qh,
-        (),
-    );
+    layer_surface.set_size(600, 400);
+    layer_surface.set_anchor(Anchor::all());
+    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+
+    wl_surface.commit();
+
+    state.surface = Some(wl_surface);
     state.layer_surface = Some(layer_surface);
 
-    let n_results = state.filtered.len();
-    let max_visible = 10usize.min(n_results);
-    let list_h = max_visible * ROW_HEIGHT as usize;
-    let total_h = (SEARCH_H + 8 + 4 + list_h as i32 + 8).min(600).max(100);
-
-    if let Some(ref ls) = state.layer_surface {
-        ls.set_size(600, total_h as u32);
-        ls.set_anchor(Anchor::Left | Anchor::Right | Anchor::Top | Anchor::Bottom);
-        ls.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        ls.set_exclusive_zone(0);
-    }
-
-    if let Some(ref s) = state.surface {
-        s.commit();
-    }
-    if event_queue.roundtrip(&mut state).is_err() {
-        eprintln!("surface was not configured");
-        std::process::exit(1);
-    }
-
-    if !state.configured {
-        eprintln!("surface was not configured");
-        std::process::exit(1);
-    }
-
-    if !state.filtered.is_empty() {
-        state.hovered_idx = Some(state.filtered[0]);
-    }
-    state.render();
-
     while state.running {
-        if event_queue.blocking_dispatch(&mut state).is_err() {
-            break;
-        }
+        event_queue.blocking_dispatch(&mut state).unwrap();
     }
 }
+
