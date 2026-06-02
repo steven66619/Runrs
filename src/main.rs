@@ -341,9 +341,12 @@ impl AppState {
                                 let h = src.height() as f64 * s;
                                 let ox = (ICON_SIZE as f64 - w) / 2.0;
                                 let oy = (ICON_SIZE as f64 - h) / 2.0;
-                                cr.set_source_surface(&src, ox, oy).ok()?;
-                                cr.rectangle(0.0, 0.0, ICON_SIZE as f64, ICON_SIZE as f64);
-                                cr.fill().ok()?;
+                                cr.save().ok()?;
+                                cr.translate(ox, oy);
+                                cr.scale(s, s);
+                                cr.set_source_surface(&src, 0.0, 0.0).ok()?;
+                                cr.paint().ok()?;
+                                cr.restore().ok()?;
                                 drop(cr);
                                 Some(dest)
                             })
