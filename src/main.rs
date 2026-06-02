@@ -163,6 +163,10 @@ fn load_bitmap_surface(path: &PathBuf) -> Option<ImageSurface> {
     Some(surface)
 }
 
+fn xpm_unquote(s: &str) -> &str {
+    s.trim_matches('"').trim_end_matches(',')
+}
+
 fn load_xpm_surface(path: &PathBuf) -> Option<ImageSurface> {
     use std::collections::HashMap;
     let s = fs::read_to_string(path).ok()?;
@@ -172,14 +176,14 @@ fn load_xpm_surface(path: &PathBuf) -> Option<ImageSurface> {
         .filter(|l| !l.starts_with("/*") && !l.is_empty() && *l != "};")
         .collect();
     let i = lines.iter().position(|l| l.starts_with('"'))?;
-    let hdr: Vec<&str> = lines[i].trim_matches('"').split_whitespace().collect();
+    let hdr: Vec<&str> = xpm_unquote(lines[i]).split_whitespace().collect();
     let w: u32 = hdr.first()?.parse().ok()?;
     let h: u32 = hdr.get(1)?.parse().ok()?;
     let n: usize = hdr.get(2)?.parse().ok()?;
     let cpp: usize = hdr.get(3)?.parse().ok()?;
     let mut cmap: HashMap<String, [u8; 4]> = HashMap::new();
     for j in 0..n {
-        let line = lines.get(i + 1 + j)?.trim_matches('"');
+        let line = xpm_unquote(lines.get(i + 1 + j)?);
         let key = &line[..cpp];
         let val = line.split("c ").nth(1)?;
         let color = if val.starts_with('#') {
@@ -212,8 +216,7 @@ fn load_xpm_surface(path: &PathBuf) -> Option<ImageSurface> {
     let stride = surface.stride() as usize;
     if let Ok(mut data) = surface.data() {
         for y in 0..h as usize {
-            let row = lines.get(pixel_start + y)?;
-            let row = row.trim_matches('"');
+            let row = xpm_unquote(lines.get(pixel_start + y)?);
             for x in 0..w as usize {
                 let key = &row[x * cpp..(x + 1) * cpp];
                 if let Some(&[b, g, r, a]) = cmap.get(key) {
