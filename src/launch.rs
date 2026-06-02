@@ -17,14 +17,21 @@ impl std::fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
-fn parse_bedrock_prefix(input: &str) -> (Option<&'static str>, &str) {
+fn parse_bedrock_prefix(input: &str) -> (Option<String>, &str) {
     let input = input.trim();
-    if let Some(rest) = input.strip_prefix("arch:") {
-        (Some("arch"), rest.trim())
-    } else if let Some(rest) = input.strip_prefix("deb:") {
-        (Some("debian"), rest.trim())
-    } else if let Some(rest) = input.strip_prefix("fed:") {
-        (Some("fedora"), rest.trim())
+    if let Some(colon) = input.find(':') {
+        let prefix = input[..colon].trim().to_lowercase();
+        let rest = input[colon + 1..].trim();
+        if rest.is_empty() {
+            return (None, input);
+        }
+        let stratum = match prefix.as_str() {
+            "arch" => "arch",
+            "deb" => "debian",
+            "fed" => "fedora",
+            other => other,
+        };
+        (Some(stratum.to_string()), rest)
     } else {
         (None, input)
     }
