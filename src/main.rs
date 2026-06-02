@@ -135,6 +135,10 @@ fn check_dir_recursive(dir: &PathBuf, target_lower: &str) -> Option<PathBuf> {
 }
 
 fn load_bitmap_surface(path: &PathBuf) -> Option<ImageSurface> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext.eq_ignore_ascii_case("xpm") {
+        return load_xpm_surface(path);
+    }
     let img = image::open(path).ok()?;
     let (w, h) = img.dimensions();
     let mut surface = ImageSurface::create(CairoFormat::ARgb32, w as i32, h as i32).ok()?;
@@ -153,6 +157,69 @@ fn load_bitmap_surface(path: &PathBuf) -> Option<ImageSurface> {
                 data[off + 1] = (g * a / 255) as u8;
                 data[off + 2] = (r * a / 255) as u8;
                 data[off + 3] = a as u8;
+            }
+        }
+    }
+    Some(surface)
+}
+
+fn load_xpm_surface(path: &PathBuf) -> Option<ImageSurface> {
+    use std::collections::HashMap;
+    let s = fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = s
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.starts_with("/*") && !l.is_empty() && *l != "};")
+        .collect();
+    let i = lines.iter().position(|l| l.starts_with('"'))?;
+    let hdr: Vec<&str> = lines[i].trim_matches('"').split_whitespace().collect();
+    let w: u32 = hdr.first()?.parse().ok()?;
+    let h: u32 = hdr.get(1)?.parse().ok()?;
+    let n: usize = hdr.get(2)?.parse().ok()?;
+    let cpp: usize = hdr.get(3)?.parse().ok()?;
+    let mut cmap: HashMap<String, [u8; 4]> = HashMap::new();
+    for j in 0..n {
+        let line = lines.get(i + 1 + j)?.trim_matches('"');
+        let key = &line[..cpp];
+        let val = line.split("c ").nth(1)?;
+        let color = if val.starts_with('#') {
+            let hex = &val[1..];
+            let (r, g, b) = match hex.len() {
+                3 => {
+                    let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+                    let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+                    let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+                    (r, g, b)
+                }
+                6 => {
+                    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                    (r, g, b)
+                }
+                _ => return None,
+            };
+            [b, g, r, 255]
+        } else if val.trim() == "None" {
+            [0, 0, 0, 0]
+        } else {
+            return None;
+        };
+        cmap.insert(key.to_string(), color);
+    }
+    let pixel_start = i + 1 + n;
+    let mut surface = ImageSurface::create(CairoFormat::ARgb32, w as i32, h as i32).ok()?;
+    let stride = surface.stride() as usize;
+    if let Ok(mut data) = surface.data() {
+        for y in 0..h as usize {
+            let row = lines.get(pixel_start + y)?;
+            let row = row.trim_matches('"');
+            for x in 0..w as usize {
+                let key = &row[x * cpp..(x + 1) * cpp];
+                if let Some(&[b, g, r, a]) = cmap.get(key) {
+                    let off = y * stride + x * 4;
+                    data[off..off + 4].copy_from_slice(&[b, g, r, a]);
+                }
             }
         }
     }
