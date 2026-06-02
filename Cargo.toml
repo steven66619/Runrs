@@ -16,6 +16,7 @@ freedesktop-desktop-entry = "0.2"
 freedesktop-icons = "0.4"
 libc = "0.2"
 librsvg = "2.62"
+image = "0.25"
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 
 

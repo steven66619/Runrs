@@ -26,6 +26,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 use xkbcommon::xkb;
 
 use cairo::{Context, Format as CairoFormat, ImageSurface};
+use image::GenericImageView;
 use rsvg::{CairoRenderer, Loader};
 
 use freedesktop_desktop_entry::{default_paths, Iter};
@@ -131,6 +132,31 @@ fn check_dir_recursive(dir: &PathBuf, target_lower: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn load_bitmap_surface(path: &PathBuf) -> Option<ImageSurface> {
+    let img = image::open(path).ok()?;
+    let (w, h) = img.dimensions();
+    let mut surface = ImageSurface::create(CairoFormat::ARgb32, w as i32, h as i32).ok()?;
+    let stride = surface.stride() as usize;
+    if let Ok(mut data) = surface.data() {
+        let rgba = img.to_rgba8();
+        for y in 0..h {
+            for x in 0..w {
+                let px = rgba.get_pixel(x, y);
+                let r = px[0] as u32;
+                let g = px[1] as u32;
+                let b = px[2] as u32;
+                let a = px[3] as u32;
+                let off = y as usize * stride + x as usize * 4;
+                data[off] = (b * a / 255) as u8;
+                data[off + 1] = (g * a / 255) as u8;
+                data[off + 2] = (r * a / 255) as u8;
+                data[off + 3] = a as u8;
+            }
+        }
+    }
+    Some(surface)
 }
 
 fn draw_rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -324,33 +350,36 @@ impl AppState {
                 Err(_) => None,
             }
         } else {
-            fs::File::open(&path)
+            let src = match fs::File::open(&path)
                 .ok()
                 .and_then(|file| {
                     ImageSurface::create_from_png(&mut std::io::BufReader::new(file)).ok()
                 })
-                .and_then(|src| {
-                    ImageSurface::create(CairoFormat::ARgb32, ICON_SIZE, ICON_SIZE)
-                        .ok()
-                        .and_then(|dest| {
-                            Context::new(&dest).ok().and_then(|cr| {
-                                let sx = ICON_SIZE as f64 / src.width() as f64;
-                                let sy = ICON_SIZE as f64 / src.height() as f64;
-                                let s = sx.min(sy);
-                                let w = src.width() as f64 * s;
-                                let h = src.height() as f64 * s;
-                                let ox = (ICON_SIZE as f64 - w) / 2.0;
-                                let oy = (ICON_SIZE as f64 - h) / 2.0;
-                                cr.save().ok()?;
-                                cr.translate(ox, oy);
-                                cr.scale(s, s);
-                                cr.set_source_surface(&src, 0.0, 0.0).ok()?;
-                                cr.paint().ok()?;
-                                cr.restore().ok()?;
-                                drop(cr);
-                                Some(dest)
-                            })
-                        })
+                .or_else(|| load_bitmap_surface(&path))
+            {
+                Some(s) => s,
+                None => return,
+            };
+            ImageSurface::create(CairoFormat::ARgb32, ICON_SIZE, ICON_SIZE)
+                .ok()
+                .and_then(|dest| {
+                    Context::new(&dest).ok().and_then(|cr| {
+                        let sx = ICON_SIZE as f64 / src.width() as f64;
+                        let sy = ICON_SIZE as f64 / src.height() as f64;
+                        let s = sx.min(sy);
+                        let w = src.width() as f64 * s;
+                        let h = src.height() as f64 * s;
+                        let ox = (ICON_SIZE as f64 - w) / 2.0;
+                        let oy = (ICON_SIZE as f64 - h) / 2.0;
+                        cr.save().ok()?;
+                        cr.translate(ox, oy);
+                        cr.scale(s, s);
+                        cr.set_source_surface(&src, 0.0, 0.0).ok()?;
+                        cr.paint().ok()?;
+                        cr.restore().ok()?;
+                        drop(cr);
+                        Some(dest)
+                    })
                 })
         };
         if let Some(surface) = loaded {
