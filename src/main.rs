@@ -164,7 +164,7 @@ fn load_bitmap_surface(path: &PathBuf) -> Option<ImageSurface> {
 }
 
 fn xpm_unquote(s: &str) -> &str {
-    s.trim_matches('"').trim_end_matches(',')
+    s.trim_end_matches(',').trim_matches('"')
 }
 
 fn load_xpm_surface(path: &PathBuf) -> Option<ImageSurface> {
