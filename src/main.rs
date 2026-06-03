@@ -430,7 +430,7 @@ impl AppState {
                                         })
                                         .unwrap_or_default()
                                 });
-                                if resolved.is_empty() || resolved != &stratum_name {
+                                if !resolved.is_empty() && resolved != &stratum_name {
                                     continue;
                                 }
                             }
@@ -1278,16 +1278,21 @@ impl X11Backend {
         {
             eprintln!("set_input_focus error: {e}");
         }
-        if let Err(e) = self.conn.grab_keyboard(
-            false,
-            self.window,
-            x11rb::CURRENT_TIME,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        ) {
-            eprintln!("grab_keyboard error: {e}");
+        for attempt in 0..50 {
+            self.conn.flush().ok();
+            let grabbed = self.conn
+                .grab_keyboard(false, self.window, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map_or(false, |r| r.status == GrabStatus::SUCCESS);
+            if grabbed {
+                break;
+            }
+            if attempt == 49 {
+                eprintln!("grab_keyboard: could not grab after 50 attempts");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        self.conn.flush().ok();
 
         while self.app.running {
             if let Ok(event) = self.conn.wait_for_event() {
