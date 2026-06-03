@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::process::Command;
 
 
 use wayland_client::{
@@ -360,6 +362,7 @@ impl AppState {
             return;
         }
         let mut loaded: Vec<Entry> = Vec::new();
+        let mut brl_cache: HashMap<String, String> = HashMap::new();
         let strata_dirs = match fs::read_dir(&bedrock_base) {
             Ok(d) => d,
             Err(_) => return,
@@ -409,17 +412,25 @@ impl AppState {
                 if !no_display {
                     if let (Some(n), Some(e)) = (name, exec) {
                         if !e.is_empty() {
-                            let bin_dir = stratum_path.join("usr/bin");
-                            if !bin_dir.exists() {
-                                continue;
-                            }
                             let bin_name = e.split_whitespace().next()
                                 .and_then(|s| std::path::Path::new(s).file_name()
                                     .and_then(|f| f.to_str()))
                                 .map(|s| s.to_string());
                             if let Some(ref binary) = bin_name {
-                                let bin_path = bin_dir.join(binary);
-                                if !bin_path.exists() {
+                                let resolved = brl_cache.entry(binary.clone()).or_insert_with(|| {
+                                    Command::new("brl-which")
+                                        .arg(binary)
+                                        .output()
+                                        .ok()
+                                        .filter(|o| o.status.success())
+                                        .and_then(|o| {
+                                            let s = String::from_utf8_lossy(&o.stdout)
+                                                .trim().to_string();
+                                            if s.is_empty() { None } else { Some(s) }
+                                        })
+                                        .unwrap_or_default()
+                                });
+                                if resolved.is_empty() || resolved != &stratum_name {
                                     continue;
                                 }
                             }

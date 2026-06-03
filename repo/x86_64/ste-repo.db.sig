@@ -1,1 +1,0 @@
-ste-repo.db.tar.zst.sig
