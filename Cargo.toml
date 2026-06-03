@@ -1,5 +1,5 @@
 [package]
-name = "launcher-wayland"
+name = "runrs"
 version = "1.0.3"
 edition = "2021"
 

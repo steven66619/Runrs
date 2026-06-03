@@ -1,17 +1,17 @@
 # Maintainer: Ste <steven4x4@gmail.com>
-pkgname=launcher-wayland-git
+pkgname=runrs-git
 pkgver=1.0.3
 pkgrel=1
-pkgdesc="Ultra-fast standard-compliant application menu overlay for Wayland and Hyprland"
+pkgdesc="Ultra-fast standard-compliant application menu overlay for Wayland and X11"
 arch=('x86_64')
-url="https://github.com/steven66619/launcher"
+url="https://github.com/steven66619/Runrs"
 license=('MIT')
 depends=('cairo' 'pango' 'libxkbcommon' 'wayland')
 makedepends=('cargo' 'git')
-provides=('launcher')
-conflicts=('launcher')
+provides=('runrs')
+conflicts=('runrs')
 
-source=("remote_repo::git+https://github.com/steven66619/launcher.git#branch=master")
+source=("remote_repo::git+https://github.com/steven66619/Runrs.git#branch=master")
 md5sums=('SKIP')
 
 validpgpkeys=('908BA367E7E797F3F72B673710F1B1E3F275953D')
@@ -28,6 +28,6 @@ build() {
 
 package() {
   cd "$srcdir/remote_repo"
-  install -Dm755 "target/release/launcher-wayland" "$pkgdir/usr/bin/launcher"
+  install -Dm755 "target/release/runrs" "$pkgdir/usr/bin/runrs"
 }
 

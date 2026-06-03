@@ -1112,26 +1112,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4345964bb142484797b161f473a503a434de77149dd8c7427788c6e13379388"
 
 [[package]]
-name = "launcher-wayland"
-version = "1.0.3"
-dependencies = [
- "cairo-rs",
- "freedesktop-desktop-entry",
- "freedesktop-icons",
- "image",
- "libc",
- "librsvg",
- "memmap2 0.9.10",
- "pango",
- "pangocairo",
- "wayland-client",
- "wayland-protocols-wlr",
- "x11rb",
- "xkbcommon",
- "xkeysym",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1983,6 +1963,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "runrs"
+version = "1.0.3"
+dependencies = [
+ "cairo-rs",
+ "freedesktop-desktop-entry",
+ "freedesktop-icons",
+ "image",
+ "libc",
+ "librsvg",
+ "memmap2 0.9.10",
+ "pango",
+ "pangocairo",
+ "wayland-client",
+ "wayland-protocols-wlr",
+ "x11rb",
+ "xkbcommon",
+ "xkeysym",
 ]
 
 [[package]]

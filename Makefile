@@ -4,9 +4,9 @@ release:
 	cargo build --release
 
 install: release
-	install -Dm755 target/release/launcher-wayland $(DESTDIR)$(PREFIX)/bin/launcher
+	install -Dm755 target/release/runrs $(DESTDIR)$(PREFIX)/bin/runrs
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/launcher
+	rm -f $(DESTDIR)$(PREFIX)/bin/runrs
 
 .PHONY: release install uninstall

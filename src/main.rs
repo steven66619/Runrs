@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::process::Command;
+
 
 use wayland_client::{
     protocol::{
@@ -352,11 +352,6 @@ impl AppState {
         loaded.sort_by(|a, b| a.name.cmp(&b.name));
         loaded.dedup_by(|a, b| a.exec == b.exec);
         self.entries = loaded;
-        for i in 0..self.entries.len() {
-            let key = self.entries[i].icon_key.clone();
-            let stratum = self.entries[i].stratum.as_deref();
-            self.entries[i].icon_path = key.and_then(|k| find_icon_path(&k, stratum));
-        }
     }
 
     fn scan_bedrock_applications(&mut self) {
@@ -414,18 +409,18 @@ impl AppState {
                 if !no_display {
                     if let (Some(n), Some(e)) = (name, exec) {
                         if !e.is_empty() {
-                            let stratum_tag = stratum_name.clone();
-                            let bin = e.split_whitespace().next().map(|s| s.to_string());
-                            if let Some(ref binary) = bin {
-                                if let Ok(output) = Command::new("brl-which").arg(binary).output() {
-                                    if output.status.success() {
-                                        let resolved = String::from_utf8_lossy(&output.stdout)
-                                            .trim()
-                                            .to_string();
-                                        if resolved != stratum_name {
-                                            continue;
-                                        }
-                                    }
+                            let bin_dir = stratum_path.join("usr/bin");
+                            if !bin_dir.exists() {
+                                continue;
+                            }
+                            let bin_name = e.split_whitespace().next()
+                                .and_then(|s| std::path::Path::new(s).file_name()
+                                    .and_then(|f| f.to_str()))
+                                .map(|s| s.to_string());
+                            if let Some(ref binary) = bin_name {
+                                let bin_path = bin_dir.join(binary);
+                                if !bin_path.exists() {
+                                    continue;
                                 }
                             }
                             loaded.push(Entry {
@@ -434,17 +429,12 @@ impl AppState {
                                 icon_key,
                                 icon_path: None,
                                 icon_surface: None,
-                                stratum: Some(stratum_tag),
+                                stratum: Some(stratum_name.clone()),
                             });
                         }
                     }
                 }
             }
-        }
-        for entry in &mut loaded {
-            let key = entry.icon_key.clone();
-            let stratum = entry.stratum.as_deref();
-            entry.icon_path = key.and_then(|k| find_icon_path(&k, stratum));
         }
         self.entries.append(&mut loaded);
     }
@@ -490,6 +480,11 @@ impl AppState {
     fn load_entry_icon(&mut self, entry_idx: usize) {
         if self.entries[entry_idx].icon_surface.is_some() {
             return;
+        }
+        if self.entries[entry_idx].icon_path.is_none() {
+            let key = self.entries[entry_idx].icon_key.clone();
+            let stratum = self.entries[entry_idx].stratum.as_deref();
+            self.entries[entry_idx].icon_path = key.and_then(|k| find_icon_path(&k, stratum));
         }
         let path = match self.entries[entry_idx].icon_path.clone() {
             Some(p) => p,

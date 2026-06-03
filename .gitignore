@@ -1,3 +1,4 @@
 /target
 /launcher/
 *.tar.gz
+bedrock-linux-*.sh
