@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::process::Command;
 
 use wayland_client::{
     protocol::{
@@ -60,9 +61,10 @@ struct Entry {
     icon_key: Option<String>,
     icon_path: Option<PathBuf>,
     icon_surface: Option<ImageSurface>,
+    stratum: Option<String>,
 }
 
-fn find_icon_path(icon_name: &str) -> Option<PathBuf> {
+fn find_icon_path(icon_name: &str, stratum: Option<&str>) -> Option<PathBuf> {
     let path = PathBuf::from(icon_name);
     if path.is_absolute() && path.exists() {
         return Some(path);
@@ -72,6 +74,16 @@ fn find_icon_path(icon_name: &str) -> Option<PathBuf> {
         PathBuf::from("/usr/share/pixmaps"),
         PathBuf::from("/usr/local/share/icons"),
     ];
+    if let Some(s) = stratum {
+        base_roots.push(PathBuf::from(format!(
+            "/bedrock/strata/{}/usr/share/icons",
+            s
+        )));
+        base_roots.push(PathBuf::from(format!(
+            "/bedrock/strata/{}/usr/share/pixmaps",
+            s
+        )));
+    }
     if let Ok(data_dirs) = std::env::var("XDG_DATA_DIRS") {
         for dir in data_dirs.split(':') {
             if !dir.is_empty() {
@@ -292,6 +304,7 @@ impl AppState {
             running: true,
         };
         s.scan_system_applications();
+        s.scan_bedrock_applications();
         s.update_filter();
         s
     }
@@ -329,6 +342,7 @@ impl AppState {
                                 icon_key,
                                 icon_path: None,
                                 icon_surface: None,
+                                stratum: None,
                             });
                         }
                     }
@@ -340,8 +354,99 @@ impl AppState {
         self.entries = loaded;
         for i in 0..self.entries.len() {
             let key = self.entries[i].icon_key.clone();
-            self.entries[i].icon_path = key.and_then(|k| find_icon_path(&k));
+            let stratum = self.entries[i].stratum.as_deref();
+            self.entries[i].icon_path = key.and_then(|k| find_icon_path(&k, stratum));
         }
+    }
+
+    fn scan_bedrock_applications(&mut self) {
+        let bedrock_base = PathBuf::from("/bedrock/strata");
+        if !bedrock_base.exists() {
+            return;
+        }
+        let mut loaded: Vec<Entry> = Vec::new();
+        let strata_dirs = match fs::read_dir(&bedrock_base) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for entry in strata_dirs.flatten() {
+            let stratum_path = entry.path();
+            if !stratum_path.is_dir() {
+                continue;
+            }
+            let stratum_name = match stratum_path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let apps_dir = stratum_path.join("usr/share/applications");
+            if !apps_dir.exists() {
+                continue;
+            }
+            let iter = Iter::new(vec![(
+                freedesktop_desktop_entry::PathSource::System,
+                apps_dir,
+            )]);
+            for path_entry in iter {
+                let file_path = &path_entry.1;
+                let content = match fs::read_to_string(file_path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut name = None;
+                let mut exec = None;
+                let mut icon_key = None;
+                let mut no_display = false;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.starts_with("NoDisplay=true") {
+                        no_display = true;
+                    } else if line.starts_with("Name=") && name.is_none() {
+                        name = Some(line.replacen("Name=", "", 1).to_string());
+                    } else if line.starts_with("Exec=") && exec.is_none() {
+                        let full_exec = line.replacen("Exec=", "", 1);
+                        let clean_exec =
+                            full_exec.split('%').next().unwrap_or("").trim().to_string();
+                        exec = Some(clean_exec);
+                    } else if line.starts_with("Icon=") && icon_key.is_none() {
+                        icon_key = Some(line.replacen("Icon=", "", 1).to_string());
+                    }
+                }
+                if !no_display {
+                    if let (Some(n), Some(e)) = (name, exec) {
+                        if !e.is_empty() {
+                            let stratum_tag = stratum_name.clone();
+                            let bin = e.split_whitespace().next().map(|s| s.to_string());
+                            if let Some(ref binary) = bin {
+                                if let Ok(output) = Command::new("brl-which").arg(binary).output() {
+                                    if output.status.success() {
+                                        let resolved = String::from_utf8_lossy(&output.stdout)
+                                            .trim()
+                                            .to_string();
+                                        if resolved != stratum_name {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            loaded.push(Entry {
+                                name: n,
+                                exec: e,
+                                icon_key,
+                                icon_path: None,
+                                icon_surface: None,
+                                stratum: Some(stratum_tag),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        for entry in &mut loaded {
+            let key = entry.icon_key.clone();
+            let stratum = entry.stratum.as_deref();
+            entry.icon_path = key.and_then(|k| find_icon_path(&k, stratum));
+        }
+        self.entries.append(&mut loaded);
     }
 
     fn update_filter(&mut self) {
@@ -371,13 +476,13 @@ impl AppState {
             if idx < self.filtered.len() {
                 let entry_idx = self.filtered[idx];
                 let target_app = &self.entries[entry_idx];
-                let _ = launch::launch_background(&target_app.exec);
+                let _ = launch::launch_background(&target_app.exec, target_app.stratum.as_deref());
                 self.running = false;
                 return;
             }
         }
         if !self.search.is_empty() {
-            let _ = launch::launch_background(&self.search);
+            let _ = launch::launch_background(&self.search, None);
             self.running = !self.search.is_empty();
         }
     }
@@ -540,6 +645,22 @@ impl AppState {
             );
             cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
             pangocairo::functions::show_layout(cr, &text_layout);
+
+            if let Some(ref stratum) = entry.stratum {
+                let tag = format!("  ({})", stratum);
+                let (_ink, logical) = text_layout.pixel_extents();
+                let extents = logical.width() as f64;
+                let tag_layout = pango::Layout::new(&pango_ctx);
+                let fd_tag = pango::FontDescription::from_string("Sans 10");
+                tag_layout.set_font_description(Some(&fd_tag));
+                tag_layout.set_text(&tag);
+                cr.move_to(
+                    sbx + PAD as f64 + text_offset + extents,
+                    row_y + ((ROW_HEIGHT - 18) / 2) as f64 + 1.0,
+                );
+                cr.set_source_rgba(0.5, 0.5, 0.6, 0.8);
+                pangocairo::functions::show_layout(cr, &tag_layout);
+            }
         }
     }
 

@@ -37,26 +37,32 @@ fn parse_bedrock_prefix(input: &str) -> (Option<String>, &str) {
     }
 }
 
-pub fn launch_background(input: &str) -> Result<(), LaunchError> {
+pub fn launch_background(input: &str, stratum: Option<&str>) -> Result<(), LaunchError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(LaunchError::EmptyCommand);
     }
 
-    let (stratum, command) = parse_bedrock_prefix(trimmed);
-    if command.is_empty() {
-        return Err(LaunchError::EmptyCommand);
-    }
+    let command = match stratum {
+        Some(_) => trimmed.to_string(),
+        None => {
+            let (_, cmd) = parse_bedrock_prefix(trimmed);
+            if cmd.is_empty() {
+                return Err(LaunchError::EmptyCommand);
+            }
+            cmd.to_string()
+        }
+    };
 
     let mut cmd = match stratum {
         Some(s) => {
             let mut c = Command::new("strat");
-            c.arg(s).arg(command);
+            c.arg(s).arg(&command);
             c
         }
         None => {
             let mut c = Command::new("sh");
-            c.arg("-c").arg(command);
+            c.arg("-c").arg(&command);
             c
         }
     };
