@@ -1290,7 +1290,7 @@ impl X11Backend {
         {
             eprintln!("set_input_focus error: {e}");
         }
-        for attempt in 0..50 {
+        for attempt in 0..200 {
             self.conn.flush().ok();
             let grabbed = self.conn
                 .grab_keyboard(false, self.window, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)
@@ -1300,10 +1300,10 @@ impl X11Backend {
             if grabbed {
                 break;
             }
-            if attempt == 49 {
-                eprintln!("grab_keyboard: could not grab after 50 attempts");
+            if attempt == 199 {
+                eprintln!("grab_keyboard: could not grab after 200 attempts");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
         while self.app.running {
