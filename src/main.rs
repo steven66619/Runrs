@@ -40,6 +40,7 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
 mod launch;
+mod theme;
 
 const MAX_ENTRIES: usize = 512;
 const ROW_HEIGHT: i32 = 40;
@@ -293,6 +294,7 @@ struct AppState {
     search: String,
     hovered_idx: Option<usize>,
     running: bool,
+    theme: theme::LauncherTheme,
 }
 
 impl AppState {
@@ -304,6 +306,7 @@ impl AppState {
             search: String::new(),
             hovered_idx: None,
             running: true,
+            theme: theme::load_theme(),
         };
         s.scan_system_applications();
         s.scan_bedrock_applications();
@@ -571,27 +574,34 @@ impl AppState {
     }
 
     fn draw(&mut self, cr: &Context, w: i32, h: i32) {
+        let t = &self.theme;
+        let br = t.border_radius as f64;
+        let bw = t.border_width as f64;
+
         cr.set_operator(cairo::Operator::Clear);
         cr.paint().ok();
         cr.set_operator(cairo::Operator::Over);
 
-        draw_rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, 8.0);
-        cr.set_source_rgba(0.04, 0.03, 0.10, 0.96);
+        let (bg_r, bg_g, bg_b, bg_a) = t.bg_rgba();
+        draw_rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, br);
+        cr.set_source_rgba(bg_r, bg_g, bg_b, bg_a);
         cr.fill().ok();
 
-        cr.set_source_rgba(0.0, 0.90, 1.0, 0.25);
-        cr.set_line_width(1.0);
-        draw_rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, 8.0);
+        let (ac_r, ac_g, ac_b, ac_a) = t.accent_rgba();
+        cr.set_source_rgba(ac_r, ac_g, ac_b, ac_a * 0.25);
+        cr.set_line_width(bw);
+        draw_rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, br);
         cr.stroke().ok();
 
         let sbx = PAD as f64;
         let sbw = (w - PAD * 2) as f64;
-        draw_rounded_rect(cr, sbx, 8.0, sbw, SEARCH_H as f64, 6.0);
-        cr.set_source_rgba(0.08, 0.06, 0.18, 0.9);
+        let search_br = (br / 2.0).max(4.0);
+        draw_rounded_rect(cr, sbx, 8.0, sbw, SEARCH_H as f64, search_br);
+        cr.set_source_rgba(bg_r, bg_g, bg_b, (bg_a * 1.4).min(1.0));
         cr.fill().ok();
-        cr.set_source_rgba(0.0, 0.90, 1.0, 0.4);
-        cr.set_line_width(1.0);
-        draw_rounded_rect(cr, sbx, 8.0, sbw, SEARCH_H as f64, 6.0);
+        cr.set_source_rgba(ac_r, ac_g, ac_b, ac_a * 0.4);
+        cr.set_line_width(bw);
+        draw_rounded_rect(cr, sbx, 8.0, sbw, SEARCH_H as f64, search_br);
         cr.stroke().ok();
 
         let disp = if self.search.is_empty() {
@@ -605,8 +615,10 @@ impl AppState {
         let lay_s = pango::Layout::new(&pango_ctx);
         lay_s.set_font_description(Some(&fd_s));
         lay_s.set_text(&disp);
+        let (tx_r, tx_g, tx_b, tx_a) = t.text_rgba();
+        let (ac_r, ac_g, ac_b, _) = t.accent_rgba();
         cr.move_to(sbx + 4.0, 8.0 + (SEARCH_H as f64 - 18.0) / 2.0);
-        cr.set_source_rgba(0.0, 0.9, 1.0, 1.0);
+        cr.set_source_rgba(ac_r, ac_g, ac_b, tx_a);
         pangocairo::functions::show_layout(cr, &lay_s);
 
         let start_y = 8.0 + (SEARCH_H as f64) + (PAD as f64);
@@ -625,7 +637,7 @@ impl AppState {
 
             if self.hovered_idx == Some(filtered_idx) {
                 draw_rounded_rect(cr, sbx, row_y, sbw, ROW_HEIGHT as f64, 4.0);
-                cr.set_source_rgba(0.0, 0.9, 1.0, 0.15);
+                cr.set_source_rgba(ac_r, ac_g, ac_b, 0.15);
                 cr.fill().ok();
             }
 
@@ -649,7 +661,7 @@ impl AppState {
                 sbx + PAD as f64 + text_offset,
                 row_y + ((ROW_HEIGHT - 18) / 2) as f64,
             );
-            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+            cr.set_source_rgba(tx_r, tx_g, tx_b, tx_a);
             pangocairo::functions::show_layout(cr, &text_layout);
 
             if let Some(ref stratum) = entry.stratum {
