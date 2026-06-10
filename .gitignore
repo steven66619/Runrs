@@ -1,4 +1,6 @@
-/target
+/build
 /launcher/
 *.tar.gz
 bedrock-linux-*.sh
+debug.log*
+build_log.txt

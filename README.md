@@ -1,98 +1,104 @@
-# launcher
+# runrs
 
-![Screenshot](launcher.png)
-
-A **lightweight**, native Wayland application launcher with automatic X11
-fallback, search, app icons, and **Bedrock Linux cross-stratum** process
-routing. Built with Cairo and Pango.
+A lightweight X11 application launcher with search, system icons, and
+Bedrock Linux cross-stratum support. Built with C++17, XCB, Cairo, and Pango.
 
 ---
 
-## ✨ Features
+## Features
 
-- **Wayland native** — uses `zwlr_layer_shell_v1` for overlay rendering; drops
-  back to X11 automatically when Wayland is unavailable
-- **Fast search** — real-time filtering across desktop entry names and `Exec`
-  fields as you type
-- **App icons** — automatic icon resolution from `XDG_DATA_DIRS` and standard
-  theme directories; renders PNG, SVG (via **librsvg**), XPM, JPEG, and WebP
-  assets with proper scaling
-- **Cross-distro launching** — type a Bedrock stratum prefix in the search bar
-  to execute commands inside any installed Linux distribution
-- **Background detachment** — all launched processes are spawned with I/O
-  suppressed and run independently after the launcher closes
+- **Fast search** — real-time filtering across desktop entry names, exec fields,
+  and generic names as you type
+- **System icons** — full XDG Icon Theme Spec resolution (SVG via librsvg, PNG)
+- **Cross-distro launching** — searches Bedrock strata for apps; displays
+  `[stratum]` tags and runs commands in the correct environment
+- **Scrollable results** — keyboard navigation with arrows, page up/down,
+  home/end; scroll arrows indicate off-screen entries
+- **Dark theme** — TOML-configurable colors with DE-aware auto-detection
+- **Network & battery metrics** — optional real-time speedometer and power
+  status in the corner
+- **Background detachment** — launched processes are fully detached
 
 ---
 
-## 📦 Dependencies
+## Dependencies
 
-| Package          | Arch                        | Debian / Ubuntu                                    | Fedora                                           |
-|------------------|-----------------------------|----------------------------------------------------|--------------------------------------------------|
-| wayland          | `wayland`                   | `libwayland-dev`                                   | `wayland-devel`                                  |
-| wayland-protocols| `wayland-protocols`         | `wayland-protocols`                                | `wayland-protocols-devel`                        |
-| cairo            | `cairo`                     | `libcairo2-dev`                                    | `cairo-devel`                                    |
-| pango            | `pango`                     | `libpango1.0-dev`                                  | `pango-devel`                                    |
-| xkbcommon        | `libxkbcommon`              | `libxkbcommon-dev`                                 | `libxkbcommon-devel`                             |
-| librsvg          | `librsvg`                   | `librsvg2-dev`                                     | `librsvg2-devel`                                 |
+| Package         | Debian / Ubuntu              |
+|-----------------|------------------------------|
+| xcb             | `libxcb-dev`                 |
+| xcb-icccm       | `libxcb-icccm4-dev`          |
+| xcb-keysyms     | `libxcb-keysyms1-dev`        |
+| xcb-aux         | `libxcb-util-dev`            |
+| cairo           | `libcairo2-dev`              |
+| pango           | `libpango1.0-dev`            |
+| librsvg         | `librsvg2-dev`               |
+| xkbcommon       | `libxkbcommon-dev`           |
 
 ### Quick install
 
 ```bash
-# Arch
-sudo pacman -S wayland wayland-protocols cairo pango libxkbcommon librsvg
-
 # Debian / Ubuntu
-sudo apt install libwayland-dev libcairo2-dev libpango1.0-dev \
-  libxkbcommon-dev wayland-protocols librsvg2-dev
-
-# Fedora
-sudo dnf install wayland-devel wayland-protocols-devel cairo-devel \
-  pango-devel libxkbcommon-devel librsvg2-devel
+sudo apt install libxcb-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
+  libxcb-util-dev libcairo2-dev libpango1.0-dev librsvg2-dev libxkbcommon-dev
 ```
 
 ---
 
-## 🔨 Build & Install
+## Build & Install
 
 ```bash
-make
+make release
 sudo make install
 ```
 
-The binary is placed at `/usr/local/bin/launcher`.
+The binary is placed at `/usr/local/bin/runrs`.
 
 ---
 
-## 🚀 Usage
+## Usage
 
-Bind to a key in your compositor (e.g. Hyprland):
+Bind to a key in your window manager:
 
 ```conf
-bind = SUPER, SPACE, exec, launcher
+# Hyprland
+bind = SUPER, SPACE, exec, runrs
+
+# i3 / sway
+bindsym Mod4+space exec runrs
 ```
 
-- **Type** to filter applications by name or command
-- **Arrow keys** to navigate the list
-- **Enter** to launch the selected entry
-- **Esc** to close
-
-Typing a raw command in the search bar and pressing Enter will execute it
-directly via `sh -c`, even when no desktop entry matches.
+- **Type** to filter applications
+- **Arrow keys**, **PgUp/PgDn**, **Home/End** to navigate
+- **Enter** to launch, **Esc** to dismiss
+- **Tab** to autocomplete from the first match
+- **Ctrl+Backspace** to delete the last word
 
 ---
 
-## 🏔️ Bedrock Linux
+## Bedrock Linux
 
-Prefix any command with a distribution shortcut to run it inside a specific
-Bedrock stratum:
+runrs automatically detects Bedrock Linux strata and tags each app with its
+stratum name: `Firefox [fedora]`, `Alacritty [arch]`.
 
-| Prefix   | Stratum    | Example                          |
-|----------|------------|----------------------------------|
-| `arch:`  | `arch`     | `arch:firefox`                   |
-| `deb:`   | `debian`   | `deb:apt update`                 |
-| `fed:`   | `fedora`   | `fed:dnf upgrade`                |
+---
 
-Any other prefix before a colon is passed through as the stratum name
-directly — `ubuntu:`, `gentoo:`, `alpine:`, `nixos:`, `void:`, etc. all work
-without configuration.
+## Configuration
 
+Create `~/.config/Runrs/config.toml`:
+
+```toml
+terminal = "foot"
+max_results = 20
+show_metrics = true
+```
+
+Theme colors can be customized in `~/.config/Runrs/config.toml`:
+
+```toml
+bg_color = "#0b081a"
+text_color = "#ffffff"
+accent_color = "#00e5ff"
+```
+
+DE-specific files (`hyprland.conf`, `sway.conf`, etc.) override the base config
+when the matching desktop environment is detected.
