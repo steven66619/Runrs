@@ -84,9 +84,10 @@ pub fn get_theme_file_name() -> String {
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("Runrs")
+    dirs::config_dir().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".config")
+    }).join("Runrs")
 }
 
 fn try_load(path: &PathBuf) -> Option<LauncherTheme> {

@@ -57,10 +57,8 @@ pub fn launch_background(input: &str, stratum: Option<&str>) -> Result<(), Launc
     let mut cmd = match stratum {
         Some(s) => {
             let mut c = Command::new("strat");
-            c.arg(s);
-            for arg in command.split_whitespace() {
-                c.arg(arg);
-            }
+            let shell_wrapper = format!("exec {}", command);
+            c.arg(s).arg("sh").arg("-c").arg(&shell_wrapper);
             c
         }
         None => {
