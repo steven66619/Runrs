@@ -95,7 +95,7 @@ Theme load_theme() {
   };
 
   auto parse_theme = [](const toml::Table &t) -> std::unique_ptr<Theme> {
-    auto th = std::make_unique<Theme>();
+    auto th = std::make_unique<Theme>(Theme::default_theme());
     auto assign = [&](const std::string &key, Rgba &field) {
       auto v = t.get(key);
       if (v) field = hex_to_rgba(*v);

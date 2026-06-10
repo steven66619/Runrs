@@ -4,8 +4,33 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace runrs {
+
+static bool match_interface(const std::string &line) {
+  return line.find("wlan0") != std::string::npos ||
+         line.find("eth0") != std::string::npos ||
+         line.find("enp")  != std::string::npos ||
+         line.find("wlp")  != std::string::npos;
+}
+
+static std::vector<uint64_t> parse_net_stats(const std::string &line) {
+  auto pos = line.find(':');
+  if (pos == std::string::npos) return {};
+  std::string rest = line.substr(pos + 1);
+  auto notspace = [](unsigned char c) { return !std::isspace(c); };
+  auto start = std::find_if(rest.begin(), rest.end(), notspace);
+  if (start == rest.end()) return {};
+  rest = std::string(start, rest.end());
+
+  std::vector<uint64_t> fields;
+  std::istringstream ss(rest);
+  uint64_t v;
+  while (ss >> v)
+    fields.push_back(v);
+  return fields;
+}
 
 bool NetworkSpeedometer::read_sys_bytes(uint64_t &rx, uint64_t &tx) {
   std::ifstream f("/proc/net/dev");
@@ -13,27 +38,14 @@ bool NetworkSpeedometer::read_sys_bytes(uint64_t &rx, uint64_t &tx) {
 
   std::string line;
   while (std::getline(f, line)) {
-    if (line.find("wlan0") != std::string::npos ||
-        line.find("eth0") != std::string::npos ||
-        line.find("enp") != std::string::npos ||
-        line.find("wlp") != std::string::npos) {
-      size_t pos = line.find(':');
-      if (pos == std::string::npos) continue;
-      auto rest = line.substr(pos + 1);
-      auto notspace = [](unsigned char c) { return !std::isspace(c); };
-      auto start = std::find_if(rest.begin(), rest.end(), notspace);
-      if (start == rest.end()) continue;
-      rest = std::string(start, rest.end());
-
-      std::istringstream ss(rest);
-      std::string val;
-      for (int i = 0; i < 9; ++i) {
-        if (!(ss >> val)) break;
-        if (i == 0) rx = std::stoull(val);
-      }
-      tx = std::stoull(val);
-      return true;
-    }
+    if (!match_interface(line)) continue;
+    auto fields = parse_net_stats(line);
+    // Standard layout: 8 RX fields + 8 TX fields
+    // RX bytes = fields[0], TX bytes = fields[8]
+    if (fields.size() < 9) return false;
+    rx = fields[0];
+    tx = fields[8];
+    return true;
   }
   return false;
 }

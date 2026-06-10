@@ -270,9 +270,9 @@ static std::vector<DesktopEntry> read_cache(const std::vector<DirInfo> &dirs,
   read32(); read32(); // magic + ver (already validated)
   uint32_t ndirs = read32();
   for (uint32_t i = 0; i < ndirs; ++i) {
-    readstr(); read32(); // path plen
-    uint32_t tmp[2];
-    f.read((char*)tmp, 8); // mtime
+    readstr();
+    int64_t mtime{};
+    f.read(reinterpret_cast<char*>(&mtime), 8);
   }
 
   uint32_t n = read32();

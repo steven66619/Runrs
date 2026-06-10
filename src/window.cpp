@@ -306,10 +306,8 @@ void LauncherWindow::run() {
 // ── Input Handling ──────────────────────────────────────────────────
 
 void LauncherWindow::handle_key_press(uint32_t keycode, uint16_t mods) {
-  auto *ks = xcb_key_symbols_alloc(conn_);
-  xcb_keysym_t sym = xcb_key_symbols_get_keysym(ks, keycode, 0);
-  if (!sym) sym = xcb_key_symbols_get_keysym(ks, keycode, 1);
-  xcb_key_symbols_free(ks);
+  xcb_keysym_t sym = xcb_key_symbols_get_keysym(keysyms_, keycode, 0);
+  if (!sym) sym = xcb_key_symbols_get_keysym(keysyms_, keycode, 1);
 
   bool ctrl = mods & XCB_MOD_MASK_CONTROL;
 
@@ -417,7 +415,7 @@ void LauncherWindow::handle_key_press(uint32_t keycode, uint16_t mods) {
   if (selection_ < scroll_offset_)
     scroll_offset_ = selection_;
   else if (selection_ >= scroll_offset_ + max_visible)
-    scroll_offset_ = selection_ - max_visible + 1;
+    scroll_offset_ = std::max(0, selection_ - max_visible + 1);
 
   dirty_ = true;
 }
@@ -538,8 +536,8 @@ void LauncherWindow::compose_results() {
 
   // Clamp scroll
   int n = (int)filtered_.size();
-  if (scroll_offset_ > n - max_visible)
-    scroll_offset_ = std::max(0, n - max_visible);
+  int max_offset = std::max(0, n - max_visible);
+  scroll_offset_ = std::clamp(scroll_offset_, 0, max_offset);
 
   int vis = std::min(n - scroll_offset_, max_visible);
   int end_y = sy + vis * ih;
